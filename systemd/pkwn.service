@@ -1,0 +1,23 @@
+[Unit]
+Description=Pkwn — multi-backend coding-agent connector (Claude Code / Codex / Gemini)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the same Linux user that already completed `pkwn auth login` for
+# each backend (claude/codex/gemini state lives under that user's $HOME /
+# $PKWN_HOME — systemd's DynamicUser or a different user will not see it).
+User=%i
+WorkingDirectory=/opt/pkwn
+ExecStart=/usr/bin/node /opt/pkwn/dist/cli.js daemon
+Restart=on-failure
+RestartSec=3
+# Secrets (PKWN_API_KEY) belong in this EnvironmentFile, mode 600, not here.
+EnvironmentFile=-/etc/pkwn/pkwn.env
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+{
+  "name": "pkwn",
+  "version": "0.1.0",
+  "description": "Reliable multi-backend coding-agent connector: routes to Claude Code, Codex CLI, and Gemini/Antigravity CLI over their own subscription logins, exposed as a persistent VPS daemon with an OpenAI-compatible API and hub-style session control.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "pkwn": "./bin/pkwn"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts daemon",
+    "start": "node dist/cli.js daemon",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
