@@ -13,7 +13,8 @@ WorkingDirectory=/opt/pkwn
 ExecStart=/usr/bin/node /opt/pkwn/dist/cli.js daemon
 Restart=on-failure
 RestartSec=3
-# Secrets (PKWN_API_KEY) belong in this EnvironmentFile, mode 600, not here.
+# Secrets (PKWN_API_KEY, PKWN_GEMINI_OAUTH_CLIENT_ID/_SECRET) belong in this
+# EnvironmentFile, mode 600, not here.
 EnvironmentFile=-/etc/pkwn/pkwn.env
 NoNewPrivileges=true
 ProtectSystem=full
