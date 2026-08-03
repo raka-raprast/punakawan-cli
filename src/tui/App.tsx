@@ -22,6 +22,9 @@ import {
   type ModelInfoResponse,
   type ModelsResponse,
   type SearchResponse,
+  type ScheduleListResponse,
+  type ScheduleMetaResponse,
+  type SkillListResponse,
   type SessionListResponse,
   type SessionMetaResponse,
 } from "../cli-shared.js";
@@ -649,7 +652,12 @@ export function ChatApp(): React.JSX.Element {
           dispatch({
             type: "SYSTEM_MESSAGE",
             text: list
-              .map((x) => `${x.id === s.activeId ? "*" : " "} ${x.id}  ${x.backend.padEnd(7)} ${x.status.padEnd(11)} ${x.cwd}${x.title ? `  — ${x.title}` : ""}`)
+              .map(
+                (x) =>
+                  `${x.id === s.activeId ? "*" : " "} ${x.id}  ${x.backend.padEnd(7)} ${x.status.padEnd(11)} ${x.cwd}${x.title ? `  — ${x.title}` : ""}${
+                    x.parentSessionId ? `  (subagent of ${x.parentSessionId.slice(0, 8)})` : ""
+                  }`,
+              )
               .join("\n"),
           });
           break;
@@ -686,6 +694,67 @@ export function ChatApp(): React.JSX.Element {
           await apiRequest(cfg, "DELETE", `/v1/sessions/${target}`);
           if (target === s.activeId) await setActiveAndConnect(cfg, undefined);
           dispatch({ type: "SYSTEM_MESSAGE", text: `deleted ${target}` });
+          break;
+        }
+        case "schedule": {
+          if (args.length < 6) {
+            dispatch({
+              type: "SYSTEM_MESSAGE",
+              text: "usage: /schedule <min> <hour> <dom> <month> <dow> <prompt>  e.g. /schedule 0 8 * * * daily build check",
+            });
+            break;
+          }
+          if (!s.activeBackend || !s.activeCwd) {
+            dispatch({ type: "SYSTEM_MESSAGE", text: "connect to a backend first (/connect) — a schedule needs a backend + cwd to run against" });
+            break;
+          }
+          const cron = args.slice(0, 5).join(" ");
+          const prompt = args.slice(5).join(" ");
+          const meta = await apiRequest<ScheduleMetaResponse>(cfg, "POST", "/v1/schedules", {
+            cron,
+            prompt,
+            backend: s.activeBackend,
+            cwd: s.activeCwd,
+            permission: s.activePermission,
+          });
+          dispatch({ type: "SYSTEM_MESSAGE", text: `scheduled ${meta.id} — next fire ${meta.nextFireAt} (UTC)` });
+          break;
+        }
+        case "schedules": {
+          const { schedules: list } = await apiRequest<ScheduleListResponse>(cfg, "GET", "/v1/schedules");
+          if (list.length === 0) {
+            dispatch({ type: "SYSTEM_MESSAGE", text: "(no schedules)" });
+            break;
+          }
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text: list
+              .map((x) => `${x.id}  ${(x.enabled ? "on " : "off").padEnd(3)} ${x.cron.padEnd(13)} next=${x.nextFireAt}  ${x.prompt.slice(0, 50)}`)
+              .join("\n"),
+          });
+          break;
+        }
+        case "unschedule": {
+          const target = args[0];
+          if (!target) {
+            dispatch({ type: "SYSTEM_MESSAGE", text: "usage: /unschedule <schedule-id>" });
+            break;
+          }
+          await apiRequest(cfg, "DELETE", `/v1/schedules/${target}`);
+          dispatch({ type: "SYSTEM_MESSAGE", text: `deleted schedule ${target}` });
+          break;
+        }
+        case "skills": {
+          const cwd = s.activeCwd ?? s.pendingCwd ?? process.cwd();
+          const { skills: list } = await apiRequest<SkillListResponse>(cfg, "GET", `/v1/skills?cwd=${encodeURIComponent(cwd)}`);
+          if (list.length === 0) {
+            dispatch({ type: "SYSTEM_MESSAGE", text: `(no skills visible for ${cwd})` });
+            break;
+          }
+          dispatch({
+            type: "SYSTEM_MESSAGE",
+            text: list.map((x) => `${x.name.padEnd(28)} (${x.scope})  ${x.description}`).join("\n"),
+          });
           break;
         }
         case "help":

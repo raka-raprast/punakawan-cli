@@ -276,3 +276,76 @@ test("ask rejects immediately when no interactive client is attached, instead of
     assert.equal(toolResult?.output, "no interactive client attached to this session");
   });
 });
+
+test("spawn_subagent creates a real, inspectable child session and returns only its final text to the parent", async () => {
+  await withTempConfig(async (config) => {
+    const fake = new FakeAdapter("claude");
+    fake.script = [
+      // Parent turn: simulates the real tool loop receiving a
+      // spawn_subagent tool_call and driving it through opts.spawnSubagent
+      // exactly as the backend adapters do.
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "parent-session" };
+        assert.ok(opts.spawnSubagent, "a top-level turn must get spawnSubagent");
+        const sub = await opts.spawnSubagent!({ prompt: "research the thing", cwd: "/repo", permission: "safe" });
+        yield { type: "tool_call", id: "call-1", name: "spawn_subagent", input: { prompt: "research the thing" } };
+        yield { type: "tool_result", id: "call-1", output: sub.finalText, isError: !sub.ok };
+        yield { type: "text", role: "assistant", text: `subagent said: ${sub.finalText}`, partial: false };
+        yield { type: "turn_complete", ok: true };
+      },
+      // Child (subagent) turn.
+      (opts) => successTurn(`findings for ${opts.prompt}`),
+    ];
+    const registry = new BackendRegistry(config, [fake]);
+    const sessions = new SessionManager(config, registry);
+    await sessions.init();
+
+    const parent = await sessions.create({ backend: "claude", cwd: "/repo", permission: "edit" });
+    const result = await sessions.sendMessage(parent.id, "please delegate this");
+
+    assert.equal(result.ok, true);
+    assert.equal(result.finalText, "subagent said: findings for research the thing");
+    assert.equal(fake.callCount, 2, "the parent turn and the child turn each call the adapter once");
+
+    const all = sessions.list();
+    assert.equal(all.length, 2, "the subagent must be a real, separately-listed session");
+    const child = all.find((s) => s.id !== parent.id);
+    assert.ok(child, "expected a child session distinct from the parent");
+    assert.equal(child!.parentSessionId, parent.id);
+    assert.equal(child!.cwd, "/repo");
+    assert.equal(child!.permission, "safe");
+    assert.equal(child!.status, "idle");
+
+    const childTail = await sessions.transcriptTail(child!.id, 100);
+    assert.ok(childTail.length > 0, "the child session keeps its own inspectable transcript");
+  });
+});
+
+test("a subagent session cannot itself spawn further subagents", async () => {
+  await withTempConfig(async (config) => {
+    const fake = new FakeAdapter("claude");
+    fake.script = [
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "parent-session" };
+        const sub = await opts.spawnSubagent!({ prompt: "go deeper", cwd: "/repo", permission: "edit" });
+        yield { type: "text", role: "assistant", text: sub.finalText, partial: false };
+        yield { type: "turn_complete", ok: true };
+      },
+      // Child turn: asserts it received no spawnSubagent capability of its own.
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "child-session" };
+        yield { type: "text", role: "assistant", text: opts.spawnSubagent ? "escaped the depth cap" : "capped as expected", partial: false };
+        yield { type: "turn_complete", ok: true };
+      },
+    ];
+    const registry = new BackendRegistry(config, [fake]);
+    const sessions = new SessionManager(config, registry);
+    await sessions.init();
+
+    const parent = await sessions.create({ backend: "claude", cwd: "/repo" });
+    const result = await sessions.sendMessage(parent.id, "delegate twice");
+
+    assert.equal(result.ok, true);
+    assert.equal(result.finalText, "capped as expected");
+  });
+});

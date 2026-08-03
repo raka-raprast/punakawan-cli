@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { pkwnHome } from "../config.js";
 import { availableTools, executeTool } from "../agent-tools/index.js";
 import { formatProjectContext, loadProjectContext } from "../project-context.js";
+import { formatSkillsManifest, loadSkills } from "../skills.js";
 import { isPortAvailable, waitForOAuthCallback } from "../oauth/callback-server.js";
 import { CloudflareCookieJar } from "../oauth/cookie-jar.js";
 import { generatePkce, generateState } from "../oauth/pkce.js";
@@ -313,7 +314,11 @@ export class CodexAdapter implements BackendAdapter {
       const tools = toolsForRequest(opts.permission);
       const input = historyToInput(opts.history, opts.prompt);
       const projectContext = await loadProjectContext(opts.cwd);
-      const instructions = projectContext ? formatProjectContext(projectContext) : undefined;
+      const skillsHome = opts.pkwnHome ?? pkwnHome();
+      const skills = await loadSkills(skillsHome, opts.cwd);
+      const instructions =
+        [projectContext ? formatProjectContext(projectContext) : undefined, skills.length > 0 ? formatSkillsManifest(skills) : undefined].filter((s): s is string => Boolean(s)).join("\n\n") ||
+        undefined;
 
       let ok = false;
       let cumulativeText = "";
@@ -363,9 +368,29 @@ export class CodexAdapter implements BackendAdapter {
         }
 
         if (iterationText) input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: iterationText }] });
-        for (const call of finishedCalls) {
+        // Executed concurrently — see claude.ts's identical comment: the
+        // request already sets parallel_tool_calls: true, so a sequential
+        // await here would just as-serialize work Codex itself expects to
+        // run in parallel. Each call's function_call/function_call_output
+        // pair stays adjacent in `input`, in original call order, once
+        // every result has resolved.
+        const executed = await Promise.all(
+          finishedCalls.map(async (call) => ({
+            call,
+            result: await executeTool(call.name, call.args, {
+              cwd: opts.cwd,
+              permission: opts.permission,
+              signal,
+              ask: opts.ask,
+              toolCallId: call.id,
+              spawnSubagent: opts.spawnSubagent,
+              skills,
+              pkwnHome: skillsHome,
+            }),
+          })),
+        );
+        for (const { call, result } of executed) {
           input.push({ type: "function_call", call_id: call.id, name: call.name, arguments: pendingCallArgs.get(call.id) ?? "{}" });
-          const result = await executeTool(call.name, call.args, { cwd: opts.cwd, permission: opts.permission, signal, ask: opts.ask, toolCallId: call.id });
           yield { type: "tool_result", id: call.id, output: result.output, isError: result.isError, meta: result.meta };
           input.push({ type: "function_call_output", call_id: call.id, output: result.output });
         }

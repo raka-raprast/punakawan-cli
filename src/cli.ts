@@ -7,13 +7,18 @@ import { SessionManager } from "./session-manager.js";
 import { createApiServer } from "./api/server.js";
 import { daemonBase, ensureDaemonRunning, isBackendId, loginBackend } from "./cli-shared.js";
 import { runChatTui } from "./tui/index.js";
+import { runTelegramGateway } from "./gateway/telegram.js";
+import { Scheduler } from "./scheduler.js";
 
 async function cmdDaemon(): Promise<void> {
   const config = await loadConfig();
   const registry = new BackendRegistry(config);
   const sessions = new SessionManager(config, registry);
   await sessions.init();
-  const server = createApiServer(config, registry, sessions);
+  const scheduler = new Scheduler(config, sessions);
+  await scheduler.init();
+  scheduler.start();
+  const server = createApiServer(config, registry, sessions, scheduler);
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -26,6 +31,7 @@ async function cmdDaemon(): Promise<void> {
 
   const shutdown = (signal: string) => {
     console.log(`received ${signal}, shutting down`);
+    scheduler.stop();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 5_000).unref();
   };
@@ -42,6 +48,11 @@ async function cmdAuthStatus(): Promise<void> {
     console.log(`${backend.adapter.displayName.padEnd(14)} ${flag}${status.mode ? ` (${status.mode})` : ""}`);
     if (status.detail) console.log(`  ${status.detail}`);
   }
+}
+
+async function cmdGatewayTelegram(): Promise<void> {
+  const config = await loadConfig();
+  await runTelegramGateway(config);
 }
 
 /** Standalone `question()` for contexts with no chat TUI already attached
@@ -138,6 +149,53 @@ async function cmdSessionsRm(id: string): Promise<void> {
   if (!res.ok) process.exitCode = 1;
 }
 
+async function cmdSchedulesList(): Promise<void> {
+  const config = await loadConfig();
+  const registry = new BackendRegistry(config);
+  const sessions = new SessionManager(config, registry);
+  await sessions.init();
+  const scheduler = new Scheduler(config, sessions);
+  await scheduler.init();
+  const list = scheduler.list();
+  if (list.length === 0) {
+    console.log("(no schedules)");
+    return;
+  }
+  for (const s of list) {
+    console.log(`${s.id}  ${(s.enabled ? "enabled " : "disabled").padEnd(8)} ${s.cron.padEnd(13)} next=${s.nextFireAt}  ${s.backend}@${s.cwd}  ${s.prompt.slice(0, 50)}`);
+  }
+}
+
+async function cmdSchedulesRun(id: string): Promise<void> {
+  const config = await loadConfig();
+  const { base, headers } = daemonBase(config);
+  try {
+    await ensureDaemonRunning(config);
+  } catch (err) {
+    console.error(String(err instanceof Error ? err.message : err));
+    process.exitCode = 1;
+    return;
+  }
+  const res = await fetch(`${base}/v1/schedules/${id}/run`, { method: "POST", headers });
+  console.log(await res.text());
+  if (!res.ok) process.exitCode = 1;
+}
+
+async function cmdSchedulesRm(id: string): Promise<void> {
+  const config = await loadConfig();
+  const { base, headers } = daemonBase(config);
+  try {
+    await ensureDaemonRunning(config);
+  } catch (err) {
+    console.error(String(err instanceof Error ? err.message : err));
+    process.exitCode = 1;
+    return;
+  }
+  const res = await fetch(`${base}/v1/schedules/${id}`, { method: "DELETE", headers });
+  console.log(await res.text());
+  if (!res.ok) process.exitCode = 1;
+}
+
 async function cmdSessionsAttach(id: string): Promise<void> {
   const config = await loadConfig();
   try {
@@ -218,6 +276,10 @@ function printUsage(): void {
       "  sessions attach <id>          attach to a session's live event stream over the daemon's API",
       "  sessions stop <id>            abort an in-flight turn on a running daemon",
       "  sessions rm <id>              delete a session from a running daemon",
+      "  schedules list                 list cron-scheduled automations",
+      "  schedules run <id>              fire a schedule immediately, out of band from its cron cadence",
+      "  schedules rm <id>               delete a schedule from a running daemon",
+      "  gateway telegram              run the Telegram messaging gateway in the foreground (see README for setup)",
       "  status                        query a running daemon's health + auth status",
       "  help                          show this list",
     ].join("\n"),
@@ -244,8 +306,12 @@ async function main(): Promise<void> {
   if (cmd === "sessions" && sub === "attach" && rest[0]) return cmdSessionsAttach(rest[0]);
   if (cmd === "sessions" && sub === "stop" && rest[0]) return cmdSessionsStop(rest[0]);
   if (cmd === "sessions" && sub === "rm" && rest[0]) return cmdSessionsRm(rest[0]);
+  if (cmd === "schedules" && sub === "list") return cmdSchedulesList();
+  if (cmd === "schedules" && sub === "run" && rest[0]) return cmdSchedulesRun(rest[0]);
+  if (cmd === "schedules" && sub === "rm" && rest[0]) return cmdSchedulesRm(rest[0]);
   if (cmd === "verify" && sub && rest[0]) return cmdVerify(sub, rest[0], rest[1] ?? process.cwd());
   if (cmd === "status") return cmdStatus();
+  if (cmd === "gateway" && sub === "telegram") return cmdGatewayTelegram();
 
   console.error(`unknown command "${cmd}"\n`);
   printUsage();

@@ -3,7 +3,8 @@
 // `tools`, Gemini `functionDeclarations`) and translates the model's tool
 // call requests back into a call to `executeTool`.
 
-import type { AskRequest, PermissionTier } from "../types.js";
+import type { AskRequest, PermissionTier, SubagentRequest, SubagentResult } from "../types.js";
+import type { Skill } from "../skills.js";
 
 export interface ToolDefinition {
   name: string;
@@ -24,6 +25,20 @@ export interface ToolContext {
    * executed — `ask_user_question` uses it to correlate its request
    * with the eventual out-of-band answer. */
   toolCallId?: string;
+  /** Lets `spawn_subagent` run an isolated child session to completion
+   * and hand back only its final text. Undefined wherever no
+   * SessionManager backs this turn, or one level into a delegation
+   * chain already (subagents can't spawn further subagents). */
+  spawnSubagent?: (request: SubagentRequest) => Promise<SubagentResult>;
+  /** The skills already loaded for this turn (global + project-merged)
+   * — `read_skill` looks a name up here rather than touching the
+   * filesystem itself. */
+  skills?: Skill[];
+  /** Root pkwnHome `write_skill` writes global-scope skills under (and
+   * `read_skill`'s `skills` list was loaded relative to). Undefined
+   * degrades `write_skill` to an error result, same as `spawnSubagent`
+   * being absent degrades `spawn_subagent`. */
+  pkwnHome?: string;
 }
 
 export interface ToolExecutionResult {

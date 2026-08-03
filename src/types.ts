@@ -87,6 +87,27 @@ export interface AskRequest {
   allowMultiple: boolean;
 }
 
+/** Input to the `spawn_subagent` tool: a self-contained task delegated to
+ * an isolated child session. `permission` may only narrow the parent
+ * session's own tier, never escalate past it (enforced by the tool, not
+ * here). */
+export interface SubagentRequest {
+  prompt: string;
+  cwd: string;
+  permission: PermissionTier;
+}
+
+/** Result handed back to the `spawn_subagent` tool call — just the
+ * subagent's final answer, never its intermediate transcript, so the
+ * parent's context pays for one tool result rather than a whole
+ * conversation. `sessionId` names the real (inspectable, resumable)
+ * child session this ran as. */
+export interface SubagentResult {
+  ok: boolean;
+  finalText: string;
+  sessionId: string;
+}
+
 export interface TurnOptions {
   /** Working directory for tool execution (file edits, shell commands). */
   cwd: string;
@@ -109,6 +130,19 @@ export interface TurnOptions {
    * is actually attached to answer at call time — the tool degrades to
    * an error result in both cases. */
   ask?: (request: AskRequest) => Promise<string[]>;
+  /** Lets the `spawn_subagent` tool run an isolated child session to
+   * completion and hand back only its final text. Undefined for
+   * contexts with no SessionManager backing them (`pkwn verify`) and for
+   * subagent turns themselves — delegation is capped at one level deep
+   * to avoid unbounded fan-out. */
+  spawnSubagent?: (request: SubagentRequest) => Promise<SubagentResult>;
+  /** Root directory skills are loaded from (`<pkwnHome>/skills` for
+   * global skills, alongside `<cwd>/.pkwn/skills` for project ones —
+   * see `src/skills.ts`). Defaults to the same global pkwnHome
+   * `homeDir` itself defaults to when omitted; distinct from `homeDir`
+   * because skills are shared knowledge, never per-backend-credential
+   * isolated. */
+  pkwnHome?: string;
 }
 
 export interface AuthStatus {
@@ -174,6 +208,10 @@ export interface SessionMeta {
   createdAt: string;
   updatedAt: string;
   lastError?: string;
+  /** Set when this session is itself a subagent spawned by
+   * `spawn_subagent` from another session's tool loop — absent for
+   * every ordinary user-initiated session. */
+  parentSessionId?: string;
 }
 
 export interface TranscriptEntry {

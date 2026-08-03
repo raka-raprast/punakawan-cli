@@ -92,9 +92,43 @@ export interface SessionMetaResponse {
   status: string;
   title?: string;
   updatedAt: string;
+  /** Set when this session is a subagent spawned by another session's
+   * `spawn_subagent` tool call — absent for ordinary sessions. */
+  parentSessionId?: string;
   /** Only present on `GET /v1/sessions/:id` — the tail of this session's
    * raw transcript, oldest first. Absent from list/create/patch responses. */
   transcriptTail?: TranscriptEntry[];
+}
+
+export interface ScheduleMetaResponse {
+  id: string;
+  cron: string;
+  prompt: string;
+  backend: BackendId;
+  cwd: string;
+  model?: string;
+  permission: PermissionTier;
+  sessionId?: string;
+  notifyTelegramChatId?: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  nextFireAt: string;
+  lastFireAt?: string;
+  lastResult?: "ok" | "error";
+  lastError?: string;
+}
+export interface ScheduleListResponse {
+  schedules: ScheduleMetaResponse[];
+}
+
+export interface SkillInfoResponse {
+  name: string;
+  description: string;
+  scope: "global" | "project";
+}
+export interface SkillListResponse {
+  skills: SkillInfoResponse[];
 }
 
 /** Regroups a session's flat transcript log back into per-turn

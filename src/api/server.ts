@@ -3,6 +3,8 @@ import { WebSocketServer, type WebSocket } from "ws";
 import type { PkwnConfig } from "../config.js";
 import type { BackendRegistry } from "../backends/registry.js";
 import { SessionManager } from "../session-manager.js";
+import type { Scheduler, ScheduleInput, SchedulePatch } from "../scheduler.js";
+import { loadSkills } from "../skills.js";
 import { Router, type RouteContext } from "./router.js";
 import { HttpError, readJsonBody, sendJson, SseWriter } from "./http-utils.js";
 import type { AgentEvent, BackendId, PermissionTier } from "../types.js";
@@ -54,9 +56,9 @@ function buildPrompt(messages: unknown[], includeHistory: boolean): string {
   return lines.join("\n\n");
 }
 
-export function createApiServer(config: PkwnConfig, registry: BackendRegistry, sessions: SessionManager): Server {
+export function createApiServer(config: PkwnConfig, registry: BackendRegistry, sessions: SessionManager, scheduler?: Scheduler): Server {
   const router = new Router();
-  registerRoutes(router, registry, sessions, config);
+  registerRoutes(router, registry, sessions, config, scheduler);
 
   const server = createServer((req, res) => {
     handleRequest(config, router, req, res).catch((err) => {
@@ -157,6 +159,7 @@ function registerRoutes(
   registry: BackendRegistry,
   sessions: SessionManager,
   config: PkwnConfig,
+  scheduler?: Scheduler,
 ): void {
   router.get("/healthz", (ctx) => {
     sendJson(ctx.res, 200, { ok: true, uptimeSec: process.uptime(), sessions: sessions.list().length });
@@ -185,6 +188,13 @@ function registerRoutes(
   router.get("/v1/auth/status", async (ctx) => {
     const statuses = await Promise.all(registry.list().map((b) => b.adapter.checkAuth(b.homeDir)));
     sendJson(ctx.res, 200, { backends: statuses });
+  });
+
+  router.get("/v1/skills", async (ctx) => {
+    const cwd = ctx.query.get("cwd");
+    if (!cwd) throw new HttpError(400, "expected ?cwd=<path>");
+    const skills = await loadSkills(config.pkwnHome, cwd);
+    sendJson(ctx.res, 200, { skills: skills.map((s) => ({ name: s.name, description: s.description, scope: s.scope })) });
   });
 
   router.post("/v1/sessions", async (ctx) => {
@@ -278,6 +288,81 @@ function registerRoutes(
   });
 
   router.post("/v1/chat/completions", (ctx) => handleChatCompletions(ctx, registry, sessions, config));
+  if (scheduler) registerScheduleRoutes(router, scheduler);
+}
+
+function registerScheduleRoutes(router: Router, scheduler: Scheduler): void {
+  router.post("/v1/schedules", async (ctx) => {
+    const body = await readJsonBody(ctx.req);
+    if (!isRecord(body) || typeof body["cron"] !== "string" || typeof body["prompt"] !== "string" || !isBackendId(body["backend"]) || typeof body["cwd"] !== "string") {
+      throw new HttpError(400, "expected { cron, prompt, backend: 'claude'|'codex'|'gemini', cwd, model?, permission?, sessionId?, notifyTelegramChatId?, enabled? }");
+    }
+    if (body["permission"] !== undefined && !isPermissionTier(body["permission"])) {
+      throw new HttpError(400, "permission must be one of 'safe' | 'edit' | 'full'");
+    }
+    const input: ScheduleInput = {
+      cron: body["cron"],
+      prompt: body["prompt"],
+      backend: body["backend"],
+      cwd: body["cwd"],
+      model: typeof body["model"] === "string" ? body["model"] : undefined,
+      permission: body["permission"] as PermissionTier | undefined,
+      sessionId: typeof body["sessionId"] === "string" ? body["sessionId"] : undefined,
+      notifyTelegramChatId: typeof body["notifyTelegramChatId"] === "string" ? body["notifyTelegramChatId"] : undefined,
+      enabled: typeof body["enabled"] === "boolean" ? body["enabled"] : undefined,
+    };
+    try {
+      sendJson(ctx.res, 201, await scheduler.create(input));
+    } catch (err) {
+      throw new HttpError(400, err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.get("/v1/schedules", (ctx) => {
+    sendJson(ctx.res, 200, { schedules: scheduler.list() });
+  });
+
+  router.get("/v1/schedules/:id", (ctx) => {
+    const meta = scheduler.get(ctx.params["id"]!);
+    if (!meta) throw new HttpError(404, "no such schedule");
+    sendJson(ctx.res, 200, meta);
+  });
+
+  router.patch("/v1/schedules/:id", async (ctx) => {
+    const id = ctx.params["id"]!;
+    if (!scheduler.get(id)) throw new HttpError(404, "no such schedule");
+    const body = await readJsonBody(ctx.req);
+    if (!isRecord(body)) throw new HttpError(400, "expected a JSON object body");
+    if (body["permission"] !== undefined && !isPermissionTier(body["permission"])) {
+      throw new HttpError(400, "permission must be one of 'safe' | 'edit' | 'full'");
+    }
+    const patch: SchedulePatch = {
+      cron: typeof body["cron"] === "string" ? body["cron"] : undefined,
+      prompt: typeof body["prompt"] === "string" ? body["prompt"] : undefined,
+      model: typeof body["model"] === "string" ? body["model"] : undefined,
+      permission: body["permission"] as PermissionTier | undefined,
+      notifyTelegramChatId: typeof body["notifyTelegramChatId"] === "string" ? body["notifyTelegramChatId"] : undefined,
+      enabled: typeof body["enabled"] === "boolean" ? body["enabled"] : undefined,
+    };
+    try {
+      sendJson(ctx.res, 200, await scheduler.update(id, patch));
+    } catch (err) {
+      throw new HttpError(400, err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  router.delete("/v1/schedules/:id", async (ctx) => {
+    const id = ctx.params["id"]!;
+    if (!scheduler.get(id)) throw new HttpError(404, "no such schedule");
+    await scheduler.remove(id);
+    sendJson(ctx.res, 200, { ok: true });
+  });
+
+  router.post("/v1/schedules/:id/run", async (ctx) => {
+    const id = ctx.params["id"]!;
+    if (!scheduler.get(id)) throw new HttpError(404, "no such schedule");
+    sendJson(ctx.res, 200, await scheduler.runNow(id));
+  });
 }
 
 async function handleChatCompletions(

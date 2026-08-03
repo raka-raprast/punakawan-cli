@@ -1,12 +1,25 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { BackendId } from "./types.js";
+import type { BackendId, PermissionTier } from "./types.js";
 
 export interface BackendConfig {
   maxConcurrency?: number;
   homeDir?: string;
   defaultModel?: string;
+}
+
+/** Config for the Telegram messaging gateway (`pkwn gateway telegram`).
+ * Deny-by-default: an empty/unset `allowedChatIds` means the gateway
+ * still runs (so you can message it to learn your own chat id) but
+ * forwards nothing to any backend — a publicly-discoverable Telegram bot
+ * wired to a shell-executing agent must never be open by default. */
+export interface TelegramGatewayConfig {
+  botToken?: string;
+  allowedChatIds?: string[];
+  backend?: BackendId;
+  cwd?: string;
+  permission?: PermissionTier;
 }
 
 export interface PkwnConfig {
@@ -17,6 +30,7 @@ export interface PkwnConfig {
   defaultTurnTimeoutMs: number;
   maxTurnRetries: number;
   backends: Partial<Record<BackendId, BackendConfig>>;
+  telegram?: TelegramGatewayConfig;
 }
 
 const DEFAULTS: Omit<PkwnConfig, "pkwnHome"> = {
@@ -29,6 +43,31 @@ const DEFAULTS: Omit<PkwnConfig, "pkwnHome"> = {
 
 export function pkwnHome(): string {
   return process.env["PKWN_HOME"] ?? join(homedir(), ".pkwn");
+}
+
+/** Merges the `telegram` block of `config.json` with its env-var
+ * overrides. Absent both, `botToken` stays undefined and
+ * `cmdGatewayTelegram` refuses to start rather than silently doing
+ * nothing — same "fail loud, not open" posture as the bind-host/API-key
+ * check below. Validation of `backend`/`permission` enum values and
+ * `cwd` presence is the gateway's job at startup, not the config
+ * loader's — this function only merges, it never rejects. */
+function loadTelegramConfig(fileValue: TelegramGatewayConfig | undefined): TelegramGatewayConfig | undefined {
+  const allowedChatIdsEnv = process.env["PKWN_TELEGRAM_ALLOWED_CHAT_IDS"];
+  const telegram: TelegramGatewayConfig = {
+    botToken: process.env["PKWN_TELEGRAM_BOT_TOKEN"] ?? fileValue?.botToken,
+    allowedChatIds: allowedChatIdsEnv
+      ? allowedChatIdsEnv
+          .split(",")
+          .map((id) => id.trim())
+          .filter(Boolean)
+      : fileValue?.allowedChatIds,
+    backend: (process.env["PKWN_TELEGRAM_BACKEND"] as BackendId | undefined) ?? fileValue?.backend,
+    cwd: process.env["PKWN_TELEGRAM_CWD"] ?? fileValue?.cwd,
+    permission: (process.env["PKWN_TELEGRAM_PERMISSION"] as PermissionTier | undefined) ?? fileValue?.permission,
+  };
+  const hasAnySetting = Object.values(telegram).some((v) => v !== undefined);
+  return hasAnySetting ? telegram : undefined;
 }
 
 export async function loadConfig(): Promise<PkwnConfig> {
@@ -53,6 +92,7 @@ export async function loadConfig(): Promise<PkwnConfig> {
     ),
     maxTurnRetries: Number(process.env["PKWN_MAX_RETRIES"] ?? fileConfig.maxTurnRetries ?? DEFAULTS.maxTurnRetries),
     backends: fileConfig.backends ?? {},
+    telegram: loadTelegramConfig(fileConfig.telegram),
   };
 
   if (config.bindHost !== "127.0.0.1" && config.bindHost !== "localhost" && !config.apiKey) {

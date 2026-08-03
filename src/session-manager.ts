@@ -25,6 +25,8 @@ import type {
   PermissionTier,
   SessionMeta,
   SessionStatus,
+  SubagentRequest,
+  SubagentResult,
   TranscriptEntry,
 } from "./types.js";
 import type { PkwnConfig } from "./config.js";
@@ -47,6 +49,9 @@ export interface CreateSessionInput {
   cwd: string;
   model?: string;
   permission?: PermissionTier;
+  /** Set when this session is being created as a subagent spawned by
+   * another session's `spawn_subagent` tool call. */
+  parentSessionId?: string;
 }
 
 export interface SendMessageResult {
@@ -82,6 +87,7 @@ interface SessionRow {
   model: string | null;
   permission: string;
   backend_session_id: string | null;
+  parent_session_id: string | null;
   status: string;
   title: string | null;
   last_error: string | null;
@@ -102,6 +108,7 @@ function rowToMeta(row: SessionRow): SessionMeta {
     lastError: row.last_error ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    parentSessionId: row.parent_session_id ?? undefined,
   };
 }
 
@@ -159,6 +166,7 @@ export class SessionManager {
         model TEXT,
         permission TEXT NOT NULL,
         backend_session_id TEXT,
+        parent_session_id TEXT,
         status TEXT NOT NULL,
         title TEXT,
         last_error TEXT,
@@ -175,6 +183,14 @@ export class SessionManager {
       CREATE INDEX IF NOT EXISTS idx_transcript_session ON transcript_entries(session_id, id);
       CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(text_content, tokenize='porter');
     `);
+    // Existing installations created `sessions` before parent_session_id
+    // existed; ALTER TABLE ADD COLUMN throws "duplicate column" on a
+    // second run, so guard it via PRAGMA table_info rather than a bare
+    // try/catch around the ALTER itself.
+    const sessionColumns = this.db.prepare("PRAGMA table_info(sessions)").all() as unknown as Array<{ name: string }>;
+    if (!sessionColumns.some((c) => c.name === "parent_session_id")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT");
+    }
 
     const rows = this.db.prepare("SELECT * FROM sessions").all() as unknown as SessionRow[];
     for (const row of rows) {
@@ -211,13 +227,14 @@ export class SessionManager {
       status: "idle",
       createdAt: now,
       updatedAt: now,
+      parentSessionId: input.parentSessionId,
     };
     this.db
       .prepare(
-        `INSERT INTO sessions (id, backend, cwd, model, permission, backend_session_id, status, title, last_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?)`,
+        `INSERT INTO sessions (id, backend, cwd, model, permission, backend_session_id, status, title, last_error, created_at, updated_at, parent_session_id)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, ?)`,
       )
-      .run(meta.id, meta.backend, meta.cwd, meta.model ?? null, meta.permission, meta.status, meta.createdAt, meta.updatedAt);
+      .run(meta.id, meta.backend, meta.cwd, meta.model ?? null, meta.permission, meta.status, meta.createdAt, meta.updatedAt, meta.parentSessionId ?? null);
     this.sessions.set(id, { meta, queue: Promise.resolve(), emitter: new EventEmitter(), pendingAsks: new Map() });
     return meta;
   }
@@ -305,6 +322,26 @@ export class SessionManager {
     return promise.finally(() => runtime.pendingAsks.delete(request.id));
   }
 
+  /** Runs `spawn_subagent`'s delegated task to completion: creates a
+   * real child session (backend/model inherited from the parent,
+   * cwd/permission as requested) and awaits one full turn on it via
+   * `sendMessage`, so it gets the exact same retry/serialization/
+   * persistence guarantees as any other session — no bespoke execution
+   * path. Only the final text comes back to the caller; the child's own
+   * transcript stays in `sessions.db` for anyone who wants to inspect or
+   * `/resume` it directly. */
+  private async runSubagent(parent: SessionRuntime, request: SubagentRequest): Promise<SubagentResult> {
+    const child = await this.create({
+      backend: parent.meta.backend,
+      cwd: request.cwd,
+      model: parent.meta.model,
+      permission: request.permission,
+      parentSessionId: parent.meta.id,
+    });
+    const result = await this.sendMessage(child.id, request.prompt);
+    return { ok: result.ok, finalText: result.finalText, sessionId: child.id };
+  }
+
   async transcriptTail(id: string, limit = 100): Promise<TranscriptEntry[]> {
     const rows = this.db
       .prepare("SELECT ts, direction, payload FROM transcript_entries WHERE session_id = ? ORDER BY id DESC LIMIT ?")
@@ -375,9 +412,11 @@ export class SessionManager {
           model: runtime.meta.model ?? backend.defaultModel,
           permission: runtime.meta.permission,
           homeDir: backend.homeDir,
+          pkwnHome: this.config.pkwnHome,
           signal: abort.signal,
           timeoutMs: this.config.defaultTurnTimeoutMs,
           ask: (request) => this.askUser(runtime, request),
+          spawnSubagent: runtime.meta.parentSessionId ? undefined : (request) => this.runSubagent(runtime, request),
         })) {
           collected.push(event);
           runtime.emitter.emit("event", event);

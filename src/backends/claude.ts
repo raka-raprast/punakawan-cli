@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import { pkwnHome } from "../config.js";
 import { availableTools, executeTool } from "../agent-tools/index.js";
 import { formatProjectContext, loadProjectContext } from "../project-context.js";
+import { formatSkillsManifest, loadSkills } from "../skills.js";
 import { generatePkce } from "../oauth/pkce.js";
 import { deleteCredential, disableCredential, isExpiringSoon, readCredential, writeCredential, type StoredCredential } from "../oauth/store.js";
 import { classifyErrorText } from "./base.js";
@@ -285,10 +286,13 @@ export class ClaudeAdapter implements BackendAdapter {
       const tools = toolsForRequest(opts.permission);
       const messages = historyToMessages(opts.history, opts.prompt);
       const projectContext = await loadProjectContext(opts.cwd);
+      const skillsHome = opts.pkwnHome ?? pkwnHome();
+      const skills = await loadSkills(skillsHome, opts.cwd);
       const system = [
         { type: "text", text: billingHeaderText(opts.prompt) },
         { type: "text", text: IDENTITY_PREAMBLE },
         ...(projectContext ? [{ type: "text", text: formatProjectContext(projectContext) }] : []),
+        ...(skills.length > 0 ? [{ type: "text", text: formatSkillsManifest(skills) }] : []),
       ];
 
       let ok = false;
@@ -359,9 +363,30 @@ export class ClaudeAdapter implements BackendAdapter {
           role: "assistant",
           content: [...(iterationText ? [{ type: "text" as const, text: iterationText }] : []), ...finishedCalls.map((c) => ({ type: "tool_use" as const, id: c.id, name: toClaudeToolName(c.name), input: c.input }))],
         });
+        // Executed concurrently — the model may emit several independent
+        // tool_use blocks in one turn (parallel reads, or several
+        // spawn_subagent calls meant to run as parallel workstreams); a
+        // sequential await here would serialize work the model already
+        // asked to fan out. Tool-result events are still yielded in the
+        // original call order afterward, so the transcript stays
+        // deterministic regardless of completion order.
+        const executed = await Promise.all(
+          finishedCalls.map(async (call) => ({
+            call,
+            result: await executeTool(call.name, call.input, {
+              cwd: opts.cwd,
+              permission: opts.permission,
+              signal,
+              ask: opts.ask,
+              toolCallId: call.id,
+              spawnSubagent: opts.spawnSubagent,
+              skills,
+              pkwnHome: skillsHome,
+            }),
+          })),
+        );
         const resultBlocks: AnthropicBlock[] = [];
-        for (const call of finishedCalls) {
-          const result = await executeTool(call.name, call.input, { cwd: opts.cwd, permission: opts.permission, signal, ask: opts.ask, toolCallId: call.id });
+        for (const { call, result } of executed) {
           yield { type: "tool_result", id: call.id, output: result.output, isError: result.isError, meta: result.meta };
           resultBlocks.push({ type: "tool_result", tool_use_id: call.id, content: result.output, is_error: result.isError });
         }

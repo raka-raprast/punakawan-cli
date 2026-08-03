@@ -1,0 +1,28 @@
+[Unit]
+Description=Pkwn — Telegram messaging gateway
+After=network-online.target pkwn@%i.service
+Wants=network-online.target
+# Not a hard dependency: the gateway self-starts the daemon
+# (omp/hermes-style, see ensureDaemonRunning) if it isn't already up, but
+# ordering after the daemon unit avoids that startup race on first boot.
+
+[Service]
+Type=simple
+# Run as the same Linux user the pkwn daemon runs as — the gateway is a
+# client of the daemon's HTTP API (PKWN_API_KEY, PKWN_PORT) and reads
+# ~/.pkwn/telegram-bindings.json under that user's $HOME/$PKWN_HOME.
+User=%i
+WorkingDirectory=/opt/pkwn
+ExecStart=/usr/bin/node /opt/pkwn/dist/cli.js gateway telegram
+Restart=on-failure
+RestartSec=3
+# Secrets (PKWN_API_KEY, PKWN_TELEGRAM_BOT_TOKEN) and the
+# PKWN_TELEGRAM_* settings below belong in this EnvironmentFile, mode
+# 600, not here.
+EnvironmentFile=-/etc/pkwn/pkwn.env
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

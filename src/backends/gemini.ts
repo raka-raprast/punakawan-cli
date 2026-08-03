@@ -18,6 +18,7 @@ import { spawn } from "node:child_process";
 import { pkwnHome } from "../config.js";
 import { availableTools, executeTool } from "../agent-tools/index.js";
 import { formatProjectContext, loadProjectContext } from "../project-context.js";
+import { formatSkillsManifest, loadSkills } from "../skills.js";
 import { findAvailablePort, waitForOAuthCallback } from "../oauth/callback-server.js";
 import { isExpiringSoon, readCredential, writeCredential, deleteCredential, disableCredential, type StoredCredential } from "../oauth/store.js";
 import { classifyErrorText, isRecord } from "./base.js";
@@ -325,7 +326,11 @@ export class GeminiAdapter implements BackendAdapter {
       const tools = toolsForRequest(opts.permission);
       const contents = historyToContents(opts.history, opts.prompt);
       const projectContext = await loadProjectContext(opts.cwd);
-      const systemInstruction = projectContext ? formatProjectContext(projectContext) : undefined;
+      const skillsHome = opts.pkwnHome ?? pkwnHome();
+      const skills = await loadSkills(skillsHome, opts.cwd);
+      const systemInstruction =
+        [projectContext ? formatProjectContext(projectContext) : undefined, skills.length > 0 ? formatSkillsManifest(skills) : undefined].filter((s): s is string => Boolean(s)).join("\n\n") ||
+        undefined;
 
       let ok = false;
       let cumulativeText = "";
@@ -371,9 +376,24 @@ export class GeminiAdapter implements BackendAdapter {
           role: "model",
           parts: [...(iterationText ? [{ text: iterationText }] : []), ...pendingCalls.map((c) => ({ functionCall: { id: c.id, name: c.name, args: c.args } }))],
         });
+        // Executed concurrently — see claude.ts's identical comment.
+        const executed = await Promise.all(
+          pendingCalls.map(async (call) => ({
+            call,
+            result: await executeTool(call.name, call.args, {
+              cwd: opts.cwd,
+              permission: opts.permission,
+              signal,
+              ask: opts.ask,
+              toolCallId: call.id,
+              spawnSubagent: opts.spawnSubagent,
+              skills,
+              pkwnHome: skillsHome,
+            }),
+          })),
+        );
         const resultParts: GeminiPart[] = [];
-        for (const call of pendingCalls) {
-          const result = await executeTool(call.name, call.args, { cwd: opts.cwd, permission: opts.permission, signal, ask: opts.ask, toolCallId: call.id });
+        for (const { call, result } of executed) {
           yield { type: "tool_result", id: call.id, output: result.output, isError: result.isError, meta: result.meta };
           resultParts.push({ functionResponse: { id: call.id, name: call.name, response: { output: result.output } } });
         }

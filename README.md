@@ -84,6 +84,67 @@ without burning further retries against your quota. Tool execution (shell)
 runs in its own process group so a runaway command is killed along with it
 on abort/timeout — never orphaned.
 
+**Subagent delegation**: the agent tool loop (available to every backend,
+not just one) includes `spawn_subagent` alongside the file/shell tools —
+a hermes-agent-style delegation primitive. It lets the model hand a
+self-contained task to an isolated child session (same backend/model,
+inheriting the parent's cwd/permission unless narrowed) and block until
+that child produces a final answer, which comes back as a single tool
+result — the parent's context pays for that one answer, never the
+child's intermediate steps. The child is a real, independently
+persisted session (inspectable, `/resume`-able, shown in `/sessions`
+tagged with its `parentSessionId`), not a throwaway. Delegation is
+capped at one level deep — a subagent can't spawn further subagents —
+and a subagent's permission tier can only narrow the parent's, never
+escalate past it. Backends execute a turn's tool calls concurrently
+(not one at a time), so a model that emits several `spawn_subagent`
+calls in one turn genuinely runs them as parallel workstreams.
+
+**Messaging gateway (Telegram)**: `pkwn gateway telegram` runs a second,
+standalone process — an HTTP client of the daemon's own API, exactly
+like the chat TUI, not a second thing with direct database access —
+that long-polls Telegram's Bot API and forwards each chat's messages to
+its own bound pkwn session (created lazily, same as `/connect` + typing
+a message). Deny-by-default: an empty `telegram.allowedChatIds` means
+every chat is told its own numeric id and refused outright — a
+publicly-discoverable Telegram bot wired to a shell-executing agent must
+never be open by default. `/new`, `/id`, `/model <id>`, and
+`/permission <tier>` work from inside the chat, same semantics as the
+TUI's own slash commands, minus the pickers (Telegram is plain text).
+
+**Scheduled automations**: a small hand-rolled 5-field cron scheduler
+(`minute hour day-of-month month day-of-week`, UTC only — no
+timezone/DST handling) lives *inside the daemon itself*, not a separate
+process — it already has `SessionManager` in hand, so firing a schedule
+is just another `sendMessage`. Each schedule gets its own persistent
+session, created lazily on first fire and reused on every subsequent
+one (a running, `/resume`-able thread, not N disposable one-shot
+turns). Delivery is optional and decoupled from the Telegram gateway's
+own long-poll process: a schedule can push its result straight to a
+Telegram chat over the same Bot API token, whether or not `pkwn gateway
+telegram` happens to be running. Manage schedules over `/v1/schedules`
+(or the TUI's `/schedule`, `/schedules`, `/unschedule`); `POST
+.../run` fires one immediately, out of band from its cron cadence.
+
+**Skills**: reusable procedural knowledge, following the open
+[agentskills.io](https://agentskills.io) standard on disk — one
+directory per skill, `SKILL.md` with YAML frontmatter (`name`,
+`description`) plus a Markdown body. Two scopes, project taking
+priority on a name collision: `<pkwnHome>/skills/<name>/` (every
+project on this install) and `<cwd>/.pkwn/skills/<name>/` (this repo
+only, meant to be committed). "Progressive disclosure", the standard's
+own term: every turn's system prompt gets the full `name`+`description`
+list (cheap), and the model reads a specific skill's full body on
+demand via the `read_skill` tool — never the reverse. `write_skill`
+(edit/full permission only) lets the model persist something it worked
+out as a new skill mid-turn. There's deliberately no separate
+background job that mines past sessions for skills automatically —
+hermes-agent's own "skills self-improve during use" framing implies a
+quality-controlled, cost-managed pipeline (dedup, relevance scoring,
+staleness pruning) that's a distinct project of its own, not a corner
+to bolt onto this one; skill creation here is always an explicit
+`write_skill` call the model makes in the course of a normal turn.
+
 ```mermaid
 flowchart LR
   subgraph clients [Clients]
@@ -190,7 +251,9 @@ node dist/cli.js auth status
 
 Environment variables override the file: `PKWN_HOME`, `PKWN_PORT`,
 `PKWN_BIND_HOST`, `PKWN_API_KEY`, `PKWN_TURN_TIMEOUT_MS`,
-`PKWN_MAX_RETRIES`.
+`PKWN_MAX_RETRIES`. The Telegram gateway (below) reads its own set:
+`PKWN_TELEGRAM_BOT_TOKEN`, `PKWN_TELEGRAM_ALLOWED_CHAT_IDS` (comma-separated),
+`PKWN_TELEGRAM_BACKEND`, `PKWN_TELEGRAM_CWD`, `PKWN_TELEGRAM_PERMISSION`.
 
 **If you bind anywhere other than `127.0.0.1`, `PKWN_API_KEY` is required —
 the daemon refuses to start otherwise.** For remote access prefer an SSH
@@ -270,6 +333,10 @@ pkwn(claude:default @ my-project)> /exit
 | `/new` | fresh conversation, same backend/cwd/model — forgets backend-side history |
 | `/resume [session-id]` | reattach to an existing session; omit id for an arrow-key list (scoped to the current folder, or all sessions if none match) |
 | `/sessions` | list sessions with their auto-generated title, `*` marks the active one |
+| `/skills` | list skills visible to the active (or pending) cwd — global + project-local |
+| `/schedule <min> <hour> <dom> <month> <dow> <prompt>` | create a cron-scheduled automation against the active backend/cwd, e.g. `/schedule 0 8 * * * daily build check` |
+| `/schedules` | list cron-scheduled automations and their next fire time |
+| `/unschedule <schedule-id>` | delete a scheduled automation |
 | `/search <text>` | full-text search across every session's transcript — responses, tool calls, tool results, file diffs, all of it |
 | `/stop` | abort the active session's in-flight turn |
 | `/rm [session-id]` | delete a session (defaults to active) |
@@ -368,19 +435,175 @@ This runs exactly one real turn straight against the adapter — no session
 persistence, no HTTP — and prints every normalized event as it streams, plus
 a final OK/FAILED.
 
+### Telegram gateway
+
+`pkwn gateway telegram` runs a standalone process that talks to
+Telegram from your phone and forwards to a pkwn session — the same
+relationship the chat TUI has to the daemon (an HTTP client of its API),
+not a second thing with direct database access. It self-starts the
+daemon if none is running, same as the TUI.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather), copy the token it gives you.
+2. Set the required env vars (or the equivalent `telegram` block in `config.json`):
+
+```bash
+export PKWN_TELEGRAM_BOT_TOKEN="123456:ABC-your-bot-token"
+export PKWN_TELEGRAM_BACKEND="claude"          # which backend new chats get
+export PKWN_TELEGRAM_CWD="/home/me/my-project" # Telegram chats have no notion of "current directory"
+# export PKWN_TELEGRAM_PERMISSION="edit"       # optional, defaults to edit
+```
+
+3. Start it and message the bot once — **deny-by-default**: with no
+   `allowedChatIds` set yet, it replies with your chat's numeric id
+   instead of forwarding anything anywhere:
+
+```bash
+node dist/cli.js gateway telegram
+```
+
+4. Authorize that chat id and restart:
+
+```bash
+export PKWN_TELEGRAM_ALLOWED_CHAT_IDS="987654321"   # comma-separated for more than one chat
+```
+
+   or the equivalent in `config.json`:
+
+```json
+{
+  "telegram": {
+    "backend": "claude",
+    "cwd": "/home/me/my-project",
+    "allowedChatIds": ["987654321"]
+  }
+}
+```
+
+Every message you send the bot after that forwards to a session bound
+to that chat (created lazily on the first real message, persisted
+across gateway restarts in `~/.pkwn/telegram-bindings.json`). In-chat
+commands:
+
+| Command | Effect |
+|---|---|
+| `/new` | drop this chat's session binding — the next message starts a fresh conversation |
+| `/id` | show which pkwn session this chat is currently bound to |
+| `/model <model-id>` | set the model on this chat's bound session |
+| `/permission <safe\|edit\|full>` | set the permission tier on this chat's bound session |
+
+Production, via systemd (runs alongside the daemon unit, not instead of it):
+
+```bash
+sudo cp systemd/pkwn-gateway-telegram.service /etc/systemd/system/pkwn-gateway-telegram@$(whoami).service
+sudo systemctl enable --now pkwn-gateway-telegram@$(whoami)
+```
+
+### Scheduled automations
+
+Cron-scheduled prompts run inside the daemon itself — no separate
+process to start. Create one over the API:
+
+```bash
+curl -X POST http://127.0.0.1:8787/v1/schedules \
+  -H "authorization: Bearer $PKWN_API_KEY" -H 'content-type: application/json' \
+  -d '{
+    "cron": "0 8 * * *",
+    "prompt": "check overnight CI runs and summarize any failures",
+    "backend": "claude",
+    "cwd": "/home/me/my-project"
+  }'
+```
+
+or from inside the chat TUI:
+
+```
+pkwn(claude:default @ my-project)> /schedule 0 8 * * * check overnight CI runs and summarize any failures
+scheduled a1b2c3d4-... — next fire 2026-08-04T08:00:00.000Z (UTC)
+```
+
+Cron syntax is the standard 5 fields (`minute hour day-of-month month
+day-of-week`), supporting `*`, lists (`1,15`), ranges (`1-5`), and steps
+(`*/15`) — **times are always UTC**, there's no per-schedule timezone.
+Each schedule gets its own session, created on first fire and reused on
+every subsequent one, so its history is a normal, `/resume`-able pkwn
+session, not N disposable one-shot turns.
+
+Optional fields: `model`, `permission` (defaults to `edit`), `sessionId`
+(attach to an already-existing session instead of creating one), and
+`notifyTelegramChatId` — pushes the result to that Telegram chat via the
+Bot API token in `telegram.botToken`, independent of whether `pkwn
+gateway telegram` is actually running (it's a direct push, not routed
+through the gateway's long-poll process).
+
+```bash
+curl http://127.0.0.1:8787/v1/schedules                  # list
+curl http://127.0.0.1:8787/v1/schedules/<id>              # detail (lastFireAt/lastResult/lastError)
+curl -X PATCH http://127.0.0.1:8787/v1/schedules/<id> -d '{"enabled": false}'
+curl -X POST http://127.0.0.1:8787/v1/schedules/<id>/run  # fire now, out of band from the cron cadence
+curl -X DELETE http://127.0.0.1:8787/v1/schedules/<id>
+```
+
+Same operations from the CLI (`list` is read-only and works even
+without a running daemon — reads `schedules.db` directly, same as
+`sessions list`; `run`/`rm` go through the live daemon):
+
+```bash
+node dist/cli.js schedules list
+node dist/cli.js schedules run <id>
+node dist/cli.js schedules rm <id>
+```
+
+Or from inside the chat TUI: `/schedule <min> <hour> <dom> <month>
+<dow> <prompt>`, `/schedules`, `/unschedule <id>`.
+
+### Skills
+
+Skills are plain files — `<pkwnHome>/skills/<name>/SKILL.md` (global)
+or `<cwd>/.pkwn/skills/<name>/SKILL.md` (project-local, meant to be
+committed) — following the open
+[agentskills.io](https://agentskills.io) `SKILL.md` format:
+
+```markdown
+---
+name: debug-flaky-e2e-tests
+description: Use this skill when an end-to-end test fails intermittently, not on every run.
+---
+
+1. Rerun the test 10x in a loop before assuming it's real.
+2. Check for shared state (ports, temp files, global singletons) between test cases.
+3. ...
+```
+
+Write one by hand, or let the model write it mid-conversation via
+`write_skill` (edit/full permission only) — it decides something's
+worth keeping, not a background job mining old sessions for patterns.
+Every turn's system prompt gets the full name+description list for
+free; the model pulls a specific skill's full body only when it
+decides one applies, via `read_skill`.
+
+```bash
+curl "http://127.0.0.1:8787/v1/skills?cwd=/home/me/my-project"
+```
+
+Or from inside the chat TUI: `/skills`.
+
 ## Repo layout
 
 ```
 src/types.ts               canonical AgentEvent/BackendAdapter/HistoryTurn contract every adapter normalizes to
 src/oauth/*.ts              shared PKCE + OAuth callback server + credentials.db credential store
-src/agent-tools/*.ts        the tool-execution loop every direct-API adapter drives itself: read/write/edit file, shell
+src/agent-tools/*.ts        the tool-execution loop every direct-API adapter drives itself: read/write/edit file, shell, spawn_subagent, read_skill/write_skill
+src/gateway/*.ts            Telegram messaging gateway: Bot API client, chat->session bindings, the pure message router, and the long-poll IO loop
 src/process/cli-runner.ts   subprocess spawn + NDJSON line streaming + process-group kill (used by the shell tool)
 src/process/semaphore.ts    per-backend concurrency limiter
 src/backends/*.ts           one direct-OAuth + direct-API adapter per backend (claude/codex/gemini), + registry.ts wiring them up
-src/session-manager.ts      sessions.db: metadata, transcript, title generation, FTS5 search, retry policy
+src/cron.ts                 hand-rolled 5-field cron parser + next-fire-time calculator (UTC only)
+src/scheduler.ts            schedules.db: cron-triggered sendMessage against a persistent per-schedule session, optional Telegram delivery
+src/skills.ts               agentskills.io-format SKILL.md loading/validation/writing (global + project-local, progressive disclosure)
 src/api/*.ts                HTTP router, OpenAI-compatible + sessions REST, WS attach
 src/cli.ts                  `pkwn` command line entry point
 systemd/pkwn.service        production deployment unit
+systemd/pkwn-gateway-telegram.service  production deployment unit for the Telegram gateway
 test/                       node:test suite (in-process fake adapter; no real backend login needed to run it)
 ```
 
