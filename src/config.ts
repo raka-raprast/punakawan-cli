@@ -27,7 +27,7 @@ const DEFAULTS: Omit<PkwnConfig, "pkwnHome"> = {
   backends: {},
 };
 
-function pkwnHome(): string {
+export function pkwnHome(): string {
   return process.env["PKWN_HOME"] ?? join(homedir(), ".pkwn");
 }
 

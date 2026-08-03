@@ -8,7 +8,7 @@
     "pkwn": "./bin/pkwn"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -18,11 +18,15 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
     "@types/ws": "^8.5.13",
+    "react-devtools-core": "^6.1.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }

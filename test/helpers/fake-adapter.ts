@@ -1,4 +1,4 @@
-import type { AgentEvent, AuthStatus, BackendAdapter, BackendId, TurnOptions } from "../../src/types.js";
+import type { AgentEvent, AuthStatus, BackendAdapter, BackendId, ModelInfo, TurnOptions } from "../../src/types.js";
 
 /** In-process fake backend: no subprocess, fully scripted event sequences
  * per call. Lets session-manager / API tests exercise retry, concurrency,
@@ -21,6 +21,19 @@ export class FakeAdapter implements BackendAdapter {
 
   async checkAuth(): Promise<AuthStatus> {
     return this.authResult;
+  }
+
+  async login(): Promise<AuthStatus> {
+    this.authResult = { backend: this.id, loggedIn: true, mode: "oauth-subscription" };
+    return this.authResult;
+  }
+
+  async logout(): Promise<void> {
+    this.authResult = { backend: this.id, loggedIn: false };
+  }
+
+  async listModels(): Promise<ModelInfo[]> {
+    return [{ id: "fake-model-1" }, { id: "fake-model-2" }];
   }
 
   async *runTurn(opts: TurnOptions): AsyncGenerator<AgentEvent, void, void> {

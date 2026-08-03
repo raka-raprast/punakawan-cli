@@ -124,21 +124,32 @@ function attachSocket(ws: WebSocket, sessionId: string, sessions: SessionManager
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(event));
   });
   ws.on("message", (raw) => {
-    let text: string | undefined;
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(raw.toString());
-      if (isRecord(parsed) && typeof parsed["text"] === "string") text = parsed["text"];
+      parsed = JSON.parse(raw.toString());
     } catch {
-      /* ignore malformed frame */
+      return; // ignore malformed frame
     }
-    if (!text) return;
-    sessions.sendMessage(sessionId, text).catch((err) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: "error", kind: "crash", message: String(err), retryable: false }));
-      }
-    });
+    if (!isRecord(parsed)) return;
+
+    if (typeof parsed["askId"] === "string" && Array.isArray(parsed["answer"])) {
+      const answer = parsed["answer"].filter((v): v is string => typeof v === "string");
+      sessions.answerAsk(sessionId, parsed["askId"], answer);
+      return;
+    }
+
+    if (typeof parsed["text"] === "string") {
+      sessions.sendMessage(sessionId, parsed["text"]).catch((err) => {
+        if (ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: "error", kind: "crash", message: String(err), retryable: false }));
+        }
+      });
+    }
   });
-  ws.on("close", unsubscribe);
+  ws.on("close", () => {
+    unsubscribe();
+    sessions.cancelPendingAsks(sessionId);
+  });
 }
 
 function registerRoutes(
@@ -161,6 +172,14 @@ function registerRoutes(
         note: "pass a concrete model id as '<backend>:<model>', e.g. 'claude:sonnet' or 'codex:gpt-5.1-codex'",
       })),
     });
+  });
+
+  router.get("/v1/backends/:backend/models", async (ctx) => {
+    const id = ctx.params["backend"];
+    if (!isBackendId(id)) throw new HttpError(400, `unknown backend "${id}" — expected claude | codex | gemini`);
+    const backend = registry.get(id);
+    const models = await backend.adapter.listModels(backend.homeDir);
+    sendJson(ctx.res, 200, { models });
   });
 
   router.get("/v1/auth/status", async (ctx) => {
@@ -187,6 +206,13 @@ function registerRoutes(
 
   router.get("/v1/sessions", (ctx) => {
     sendJson(ctx.res, 200, { sessions: sessions.list() });
+  });
+
+  router.get("/v1/sessions/search", async (ctx) => {
+    const q = ctx.query.get("q");
+    if (!q) throw new HttpError(400, "expected ?q=<search text>");
+    const limit = Number(ctx.query.get("limit") ?? 20);
+    sendJson(ctx.res, 200, { results: await sessions.search(q, limit) });
   });
 
   router.get("/v1/sessions/:id", async (ctx) => {

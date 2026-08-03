@@ -21,7 +21,7 @@ export class BackendRegistry {
       return {
         adapter,
         semaphore: new Semaphore(override?.maxConcurrency ?? adapter.defaultMaxConcurrency),
-        homeDir: override?.homeDir,
+        homeDir: override?.homeDir ?? config.pkwnHome,
         defaultModel: override?.defaultModel,
       };
     };

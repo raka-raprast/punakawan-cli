@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
+import { WebSocket } from "ws";
 import type { PkwnConfig } from "../src/config.js";
 import { BackendRegistry } from "../src/backends/registry.js";
 import { SessionManager } from "../src/session-manager.js";
@@ -249,4 +250,64 @@ test("ephemeral chat completion does not persist a session", async () => {
     const list = await readJson<SessionListResponse>(await fetch(`${base}/v1/sessions`, { headers }));
     assert.equal(list.sessions.length, 0);
   });
+});
+
+test("attached WS client can answer a live ask_user_question mid-turn", async () => {
+  const pkwnHome = await mkdtemp(join(tmpdir(), "pkwn-api-test-"));
+  const config: PkwnConfig = { pkwnHome, port: 0, bindHost: "127.0.0.1", defaultTurnTimeoutMs: 5_000, maxTurnRetries: 1, backends: {} };
+  const fake = new FakeAdapter("claude");
+  fake.script = [
+    async function* (opts) {
+      yield { type: "started", backendSessionId: "fake-session-1" };
+      const answerPromise = opts.ask!({ id: "call-1", question: "which stack?", options: [{ label: "Next.js" }, { label: "Express" }], allowMultiple: false });
+      yield { type: "tool_call", id: "call-1", name: "ask_user_question", input: { question: "which stack?", options: [{ label: "Next.js" }, { label: "Express" }] } };
+      const answer = await answerPromise;
+      yield { type: "tool_result", id: "call-1", output: `user chose: ${answer.join(", ")}`, isError: false };
+      yield { type: "text", role: "assistant", text: "ok", partial: false };
+      yield { type: "turn_complete", ok: true };
+    },
+  ];
+  const registry = new BackendRegistry(config, [fake]);
+  const sessions = new SessionManager(config, registry);
+  await sessions.init();
+  const server = createApiServer(config, registry, sessions);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+
+  try {
+    const create = await fetch(`http://127.0.0.1:${port}/v1/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ backend: "claude", cwd: "/tmp" }),
+    });
+    const meta = await readJson<SessionResponse>(create);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/sessions/${meta.id}/attach`);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", resolve);
+      ws.once("error", reject);
+    });
+
+    const events: Array<Record<string, unknown>> = [];
+    const { promise: turnComplete, resolve: signalTurnComplete } = Promise.withResolvers<void>();
+    ws.on("message", (raw) => {
+      const event = JSON.parse(raw.toString()) as Record<string, unknown>;
+      events.push(event);
+      if (event["type"] === "tool_call" && event["name"] === "ask_user_question") {
+        ws.send(JSON.stringify({ askId: event["id"], answer: ["Next.js"] }));
+      }
+      if (event["type"] === "turn_complete") signalTurnComplete();
+    });
+
+    ws.send(JSON.stringify({ text: "pick a stack" }));
+    await turnComplete;
+    ws.close();
+
+    const toolResult = events.find((e) => e["type"] === "tool_result");
+    assert.equal(toolResult?.["output"], "user chose: Next.js");
+    assert.equal(toolResult?.["isError"], false);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(pkwnHome, { recursive: true, force: true });
+  }
 });

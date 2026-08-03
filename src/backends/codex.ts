@@ -1,237 +1,388 @@
-// Adapter for OpenAI's `codex` CLI, driven headlessly via `codex exec --json`
-// (or `codex exec resume <id> --json` to continue). Auth is whatever
-// `codex login` already established in $CODEX_HOME/auth.json — this adapter
-// never reads or copies that file, only shells out to `codex login status`.
+// Direct ChatGPT-backend Codex adapter — pkwn's own OAuth login + direct
+// HTTP calls to chatgpt.com/backend-api/codex, no `codex` binary involved.
 //
-// IMPORTANT concurrency note (grounded in OpenAI's own CI/CD auth guide):
-// concurrent `codex exec` processes sharing one ChatGPT-OAuth auth.json can
-// race on refresh-token rotation and invalidate each other's session. The
-// registry (registry.ts) enforces maxConcurrency=1 for this backend unless
-// each session is given its own CODEX_HOME (homeDir) with an independently
-// logged-in account.
+// OAuth client_id and every endpoint below are read directly out of
+// OpenAI's own open-source codex-rs implementation (github.com/openai/codex),
+// not guessed. The `originator`/`User-Agent` values intentionally mirror
+// the official Rust CLI's own values (`codex_cli_rs`) — the backend
+// classifies requests by this header (source: `is_first_party_originator()`
+// helpers in codex-rs), so an honestly-different value would very likely
+// just be rejected outright rather than "work but be labeled differently."
+// This is exactly the ToS-risk tradeoff already accepted for this feature.
 
-import { runProcess } from "../process/cli-runner.js";
-import { classifyErrorText, isRecord, tryParseJson } from "./base.js";
-import type {
-  AgentEvent,
-  AuthStatus,
-  BackendAdapter,
-  PermissionTier,
-  TurnOptions,
-} from "../types.js";
+import { randomBytes, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { pkwnHome } from "../config.js";
+import { availableTools, executeTool } from "../agent-tools/index.js";
+import { formatProjectContext, loadProjectContext } from "../project-context.js";
+import { isPortAvailable, waitForOAuthCallback } from "../oauth/callback-server.js";
+import { CloudflareCookieJar } from "../oauth/cookie-jar.js";
+import { generatePkce, generateState } from "../oauth/pkce.js";
+import { deleteCredential, disableCredential, isExpiringSoon, readCredential, writeCredential, type StoredCredential } from "../oauth/store.js";
+import { classifyErrorText } from "./base.js";
+import type { AgentEvent, AuthStatus, BackendAdapter, HistoryBlock, HistoryTurn, ModelInfo, PermissionTier, TurnOptions, UsageInfo } from "../types.js";
 
-function sandboxArgs(tier: PermissionTier): string[] {
-  switch (tier) {
-    case "safe":
-      return ["--sandbox", "read-only"];
-    case "edit":
-      return ["--sandbox", "workspace-write", "--approve-for-me"];
-    case "full":
-      return ["--dangerously-bypass-approvals-and-sandbox"];
+const ISSUER = "https://auth.openai.com";
+const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CALLBACK_PORTS = [1455, 1457]; // server-side allow-listed — no other port will work
+const SCOPES = "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CHATGPT_CODEX_BASE = "https://chatgpt.com/backend-api/codex";
+const ORIGINATOR = "codex_cli_rs";
+// The models endpoint 400s without this — confirmed empirically against
+// the real endpoint; matches the installed codex CLI's own version at
+// research time. Bump if OpenAI starts rejecting it as too old.
+const CLIENT_VERSION = "0.146.0";
+// Confirmed against the real codex-cli's live models_cache.json (fetched
+// from chatgpt.com/backend-api on 2026-08-02): "gpt-5-codex" is stale and
+// rejected for ChatGPT-account auth with a 400. Priority-1 model at that
+// snapshot was "gpt-5.6-sol" — verify this against a fresh `codex` CLI
+// install if OpenAI reshuffles the catalog again.
+const DEFAULT_MODEL = "gpt-5.6-sol";
+const OAUTH_LOGIN_TIMEOUT_MS = 5 * 60_000;
+
+function userAgent(): string {
+  const platform = process.platform === "darwin" ? "Mac OS" : process.platform === "win32" ? "Windows" : "Linux";
+  return `${ORIGINATOR}/0.1.0 (${platform}; ${process.arch}) pkwn`;
+}
+
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  const segment = token.split(".")[1];
+  if (!segment) return {};
+  try {
+    return JSON.parse(Buffer.from(segment, "base64url").toString("utf8")) as Record<string, unknown>;
+  } catch {
+    return {};
   }
 }
 
-function buildArgs(opts: TurnOptions): string[] {
-  const common = ["--json", "-C", opts.cwd, ...sandboxArgs(opts.permission)];
-  if (opts.model) common.push("-m", opts.model);
-  if (opts.resumeId) {
-    return ["exec", "resume", opts.resumeId, ...common, opts.prompt];
+interface ChatgptClaims {
+  email?: string;
+  chatgpt_account_id?: string;
+  chatgpt_plan_type?: string;
+  chatgpt_account_is_fedramp?: boolean;
+}
+
+function chatgptClaims(idToken: string): ChatgptClaims {
+  const payload = decodeJwtPayload(idToken);
+  const profile = payload["https://api.openai.com/profile"];
+  const auth = payload["https://api.openai.com/auth"];
+  const email = typeof profile === "object" && profile && "email" in profile ? String((profile as Record<string, unknown>)["email"]) : undefined;
+  const authRecord = typeof auth === "object" && auth ? (auth as Record<string, unknown>) : {};
+  return {
+    email,
+    chatgpt_account_id: typeof authRecord["chatgpt_account_id"] === "string" ? (authRecord["chatgpt_account_id"] as string) : undefined,
+    chatgpt_plan_type: typeof authRecord["chatgpt_plan_type"] === "string" ? (authRecord["chatgpt_plan_type"] as string) : undefined,
+    chatgpt_account_is_fedramp: authRecord["chatgpt_account_is_fedramp"] === true,
+  };
+}
+
+interface TokenResponse {
+  id_token: string;
+  access_token: string;
+  refresh_token?: string;
+}
+
+async function findAllowedCallback(): Promise<{ port: number; redirectUri: string }> {
+  for (const port of CALLBACK_PORTS) {
+    if (await isPortAvailable(port)) return { port, redirectUri: `http://localhost:${port}/auth/callback` };
   }
-  return ["exec", ...common, opts.prompt];
+  throw new Error(`neither of codex's allow-listed callback ports (${CALLBACK_PORTS.join(", ")}) is free`);
 }
 
-function buildEnv(opts: TurnOptions): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  if (opts.homeDir) env["CODEX_HOME"] = opts.homeDir;
-  return env;
+async function refreshAccessToken(refreshToken: string): Promise<TokenResponse> {
+  const res = await fetch(`${ISSUER}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_id: CLIENT_ID, grant_type: "refresh_token", refresh_token: refreshToken }),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`codex token refresh -> ${res.status}: ${text}`);
+  return JSON.parse(text) as TokenResponse;
 }
 
-function itemToEvents(item: unknown): AgentEvent[] {
-  if (!isRecord(item)) return [];
-  const out: AgentEvent[] = [];
-  const id = String(item["id"] ?? "");
-  switch (item["type"]) {
-    case "agent_message":
-      out.push({
-        type: "text",
-        role: "assistant",
-        text: String(item["text"] ?? ""),
-        partial: true, // corrected to false on item.completed by caller
-      });
-      break;
-    case "reasoning":
-      out.push({ type: "reasoning", text: String(item["text"] ?? "") });
-      break;
-    case "command_execution":
-      out.push({
-        type: "tool_call",
-        id,
-        name: "bash",
-        input: { command: item["command"] },
-      });
-      if (item["status"] === "completed" || item["status"] === "failed") {
-        out.push({
-          type: "tool_result",
-          id,
-          output: item["aggregated_output"],
-          isError: item["status"] === "failed",
-        });
-      }
-      break;
-    case "file_change":
-      out.push({ type: "tool_call", id, name: "file_change", input: item["changes"] });
-      if (item["status"] === "completed" || item["status"] === "failed") {
-        out.push({ type: "tool_result", id, output: item["changes"], isError: item["status"] === "failed" });
-      }
-      break;
-    case "mcp_tool_call":
-      out.push({
-        type: "tool_call",
-        id,
-        name: `${item["server"]}.${item["tool"]}`,
-        input: item["arguments"],
-      });
-      if (item["result"] !== undefined || item["error"] !== undefined) {
-        const err = item["error"];
-        out.push({
-          type: "tool_result",
-          id,
-          output: item["result"],
-          isError: err !== null && err !== undefined,
-          error: isRecord(err) ? String(err["message"] ?? "") : undefined,
-        });
-      }
-      break;
-    case "web_search":
-      out.push({ type: "tool_call", id, name: "web_search", input: { query: item["query"] } });
-      break;
-    case "todo_list":
-      out.push({ type: "tool_result", id, output: item["items"], isError: false });
-      break;
-    case "error":
-      out.push({
-        type: "error",
-        kind: classifyErrorText(String(item["message"] ?? "")),
-        message: String(item["message"] ?? ""),
-        retryable: true,
-      });
-      break;
-    default:
-      break;
+async function getValidAccessToken(homeDir: string): Promise<{ accessToken: string; accountId?: string; fedramp: boolean }> {
+  const cred = await readCredential(homeDir, "codex");
+  if (!cred) throw new Error("not logged in — run /connect codex");
+  const extra = (cred.extra ?? {}) as { chatgptAccountId?: string; fedramp?: boolean };
+  if (!isExpiringSoon(cred)) return { accessToken: cred.accessToken, accountId: extra.chatgptAccountId, fedramp: extra.fedramp ?? false };
+  if (!cred.refreshToken) throw new Error("access token expired and no refresh token stored — re-run /connect codex");
+
+  let refreshed: TokenResponse;
+  try {
+    refreshed = await refreshAccessToken(cred.refreshToken);
+  } catch (err) {
+    await disableCredential(homeDir, "codex", err instanceof Error ? err.message : String(err));
+    throw err;
   }
-  return out;
+  const claims = chatgptClaims(refreshed.id_token);
+  const updated: StoredCredential = {
+    accessToken: refreshed.access_token,
+    // OpenAI's refresh grant DOES rotate refresh tokens and enforces
+    // single-use (a reused stale token is a hard failure server-side) —
+    // always persist whatever the response returns.
+    refreshToken: refreshed.refresh_token ?? cred.refreshToken,
+    identity: claims.email ?? cred.identity,
+    extra: { chatgptAccountId: claims.chatgpt_account_id, fedramp: claims.chatgpt_account_is_fedramp ?? false, planType: claims.chatgpt_plan_type },
+  };
+  await writeCredential(homeDir, "codex", updated);
+  return { accessToken: updated.accessToken, accountId: claims.chatgpt_account_id, fedramp: claims.chatgpt_account_is_fedramp ?? false };
 }
 
-async function* translate(
-  lines: AsyncIterable<string>,
-): AsyncGenerator<AgentEvent, void, void> {
-  for await (const line of lines) {
-    const msg = tryParseJson(line);
-    if (!isRecord(msg)) continue;
+type ResponseItem =
+  | { type: "message"; role: "user" | "assistant"; content: Array<{ type: "input_text" | "output_text"; text: string }> }
+  | { type: "function_call"; call_id: string; name: string; arguments: string }
+  | { type: "function_call_output"; call_id: string; output: string };
 
-    switch (msg["type"]) {
-      case "thread.started":
-        if (typeof msg["thread_id"] === "string") {
-          yield { type: "started", backendSessionId: msg["thread_id"] };
+function blockToItems(role: "user" | "assistant", block: HistoryBlock): ResponseItem {
+  if (block.type === "tool_use") return { type: "function_call", call_id: block.id ?? "", name: block.name ?? "", arguments: JSON.stringify(block.input ?? {}) };
+  if (block.type === "tool_result") return { type: "function_call_output", call_id: block.id ?? "", output: typeof block.output === "string" ? block.output : JSON.stringify(block.output ?? "") };
+  return { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text: block.text ?? "" }] };
+}
+
+function historyToInput(history: HistoryTurn[], prompt: string): ResponseItem[] {
+  const items = history.flatMap((turn) => turn.blocks.map((block) => blockToItems(turn.role, block)));
+  items.push({ type: "message", role: "user", content: [{ type: "input_text", text: prompt }] });
+  return items;
+}
+
+function toolsForRequest(permission: PermissionTier): Array<{ type: "function"; name: string; description: string; strict: boolean; parameters: Record<string, unknown> }> {
+  return availableTools(permission).map((t) => ({ type: "function", name: t.name, description: t.description, strict: false, parameters: t.inputSchema }));
+}
+
+interface SseEvent {
+  type: string;
+  delta?: string;
+  item?: { type?: string; call_id?: string; name?: string; arguments?: string; content?: Array<{ type?: string; text?: string }> };
+  response?: { usage?: { input_tokens?: number; output_tokens?: number; cached_tokens?: number } };
+}
+
+async function* streamResponses(
+  accessToken: string,
+  accountId: string | undefined,
+  fedramp: boolean,
+  cookies: CloudflareCookieJar,
+  body: Record<string, unknown>,
+  signal: AbortSignal,
+): AsyncGenerator<SseEvent, void, void> {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${accessToken}`,
+    "content-type": "application/json",
+    accept: "text/event-stream",
+    originator: ORIGINATOR,
+    "user-agent": userAgent(),
+    "session-id": randomUUID(),
+    "x-client-request-id": randomUUID(),
+    "x-codex-installation-id": randomUUID(),
+  };
+  if (accountId) headers["ChatGPT-Account-ID"] = accountId;
+  if (fedramp) headers["X-OpenAI-Fedramp"] = "true";
+  const cookieHeader = cookies.header();
+  if (cookieHeader) headers["cookie"] = cookieHeader;
+
+  const res = await fetch(`${CHATGPT_CODEX_BASE}/responses`, { method: "POST", headers, body: JSON.stringify(body), signal });
+  cookies.absorb(res.headers);
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`codex responses -> ${res.status}: ${text}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines: string[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx: number;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      if (line.startsWith("data: ")) {
+        dataLines.push(line.slice(6).trim());
+      } else if (line === "" && dataLines.length > 0) {
+        const chunk = dataLines.join("\n");
+        dataLines = [];
+        try {
+          yield JSON.parse(chunk) as SseEvent;
+        } catch {
+          // skip a malformed/partial SSE frame
         }
-        break;
-      case "item.started":
-      case "item.updated":
-        for (const ev of itemToEvents(msg["item"])) yield ev;
-        break;
-      case "item.completed": {
-        const item = msg["item"];
-        for (const ev of itemToEvents(item)) {
-          // agent_message is only truly final on item.completed.
-          yield ev.type === "text" ? { ...ev, partial: false } : ev;
-        }
-        break;
       }
-      case "turn.completed": {
-        const usage = msg["usage"];
-        yield {
-          type: "usage",
-          usage: isRecord(usage)
-            ? {
-                inputTokens: Number(usage["input_tokens"] ?? 0),
-                outputTokens: Number(usage["output_tokens"] ?? 0),
-                cachedInputTokens: Number(usage["cached_input_tokens"] ?? 0),
-              }
-            : {},
-        };
-        yield { type: "turn_complete", ok: true };
-        break;
-      }
-      case "turn.failed": {
-        const error = msg["error"];
-        const message = isRecord(error) ? String(error["message"] ?? "unknown error") : "unknown error";
-        const kind = classifyErrorText(message);
-        yield { type: "error", kind, message, retryable: kind !== "auth" };
-        yield { type: "turn_complete", ok: false };
-        break;
-      }
-      case "error": {
-        const message = String(msg["message"] ?? "unknown error");
-        yield { type: "error", kind: classifyErrorText(message), message, retryable: false };
-        break;
-      }
-      default:
-        break;
     }
   }
 }
 
 export class CodexAdapter implements BackendAdapter {
   readonly id = "codex" as const;
-  readonly displayName = "Codex CLI";
-  // See file header: sharing one ChatGPT-OAuth auth.json across concurrent
-  // `codex exec` processes risks refresh-token races. Keep this at 1 unless
-  // the deployment gives every session its own logged-in CODEX_HOME.
-  readonly defaultMaxConcurrency = 1;
+  readonly displayName = "Codex (direct API)";
+  readonly defaultMaxConcurrency = 1; // OpenAI's OAuth refresh token is documented as unsafe under concurrent use
 
   async checkAuth(homeDir?: string): Promise<AuthStatus> {
-    const env = { ...process.env };
-    if (homeDir) env["CODEX_HOME"] = homeDir;
-    const proc = runProcess("codex", ["login", "status"], {
-      cwd: process.cwd(),
-      env,
-      timeoutMs: 15_000,
+    const cred = await readCredential(homeDir ?? pkwnHome(), "codex");
+    if (!cred) return { backend: "codex", loggedIn: false, detail: "not logged in" };
+    if (cred.disabledCause) return { backend: "codex", loggedIn: false, detail: cred.disabledCause };
+    return { backend: "codex", loggedIn: true, mode: "oauth-subscription", detail: cred.identity ?? "logged in" };
+  }
+
+  async login(opts: { homeDir?: string }): Promise<AuthStatus> {
+    const home = opts.homeDir ?? pkwnHome();
+    const { port, redirectUri } = await findAllowedCallback();
+    const pkce = generatePkce();
+    const state = generateState();
+
+    const authUrl = new URL(`${ISSUER}/oauth/authorize`);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", CLIENT_ID);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("scope", SCOPES);
+    authUrl.searchParams.set("code_challenge", pkce.challenge);
+    authUrl.searchParams.set("code_challenge_method", "S256");
+    authUrl.searchParams.set("id_token_add_organizations", "true");
+    authUrl.searchParams.set("codex_cli_simplified_flow", "true");
+    authUrl.searchParams.set("originator", ORIGINATOR);
+    authUrl.searchParams.set("state", state);
+
+    console.log(`open this URL to sign in with ChatGPT:\n${authUrl.toString()}\n`);
+    openBrowser(authUrl.toString());
+
+    const callback = await waitForOAuthCallback({ port, path: "/auth/callback", timeoutMs: OAUTH_LOGIN_TIMEOUT_MS });
+    if (callback.state !== state) throw new Error("oauth state mismatch on callback — aborting");
+
+    const res = await fetch(`${ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: callback.code,
+        redirect_uri: redirectUri,
+        client_id: CLIENT_ID,
+        code_verifier: pkce.verifier,
+      }),
     });
-    for await (const _line of proc.lines) {
-      /* codex login status writes to stderr, not stdout; drain stdout anyway */
-    }
-    const result = await proc.done;
-    return {
-      backend: "codex",
-      loggedIn: result.code === 0,
-      mode: /chatgpt/i.test(result.stderr) ? "oauth-subscription" : /api key/i.test(result.stderr) ? "api-key" : undefined,
-      detail: result.stderr.trim(),
+    const text = await res.text();
+    if (!res.ok) throw new Error(`codex token exchange -> ${res.status}: ${text}`);
+    const tokens = JSON.parse(text) as TokenResponse;
+    const claims = chatgptClaims(tokens.id_token);
+
+    const cred: StoredCredential = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      identity: claims.email,
+      extra: { chatgptAccountId: claims.chatgpt_account_id, fedramp: claims.chatgpt_account_is_fedramp ?? false, planType: claims.chatgpt_plan_type },
     };
+    await writeCredential(home, "codex", cred);
+    return { backend: "codex", loggedIn: true, mode: "oauth-subscription", detail: claims.email ?? "logged in" };
+  }
+
+  async logout(homeDir?: string): Promise<void> {
+    await deleteCredential(homeDir ?? pkwnHome(), "codex");
+  }
+
+  /** Live query against the same `chatgpt.com/backend-api/codex/models`
+   * endpoint the real CLI's `models_cache.json` is populated from
+   * (confirmed via direct curl with a real token: 400 without
+   * `client_version`, 200 with it — this is not guessed). Filters out
+   * `visibility !== "list"` entries (e.g. `codex-auto-review`, an
+   * internal-only reviewer model the CLI itself never shows a user). */
+  async listModels(homeDir?: string): Promise<ModelInfo[]> {
+    const { accessToken, accountId } = await getValidAccessToken(homeDir ?? pkwnHome());
+    const headers: Record<string, string> = { authorization: `Bearer ${accessToken}` };
+    if (accountId) headers["chatgpt-account-id"] = accountId;
+    const res = await fetch(`${CHATGPT_CODEX_BASE}/models?client_version=${encodeURIComponent(CLIENT_VERSION)}`, { headers });
+    if (!res.ok) throw new Error(`list models -> ${res.status}: ${await res.text()}`);
+    const data = (await res.json()) as { models: Array<{ slug: string; display_name?: string; description?: string; visibility?: string }> };
+    return data.models.filter((m) => m.visibility === "list").map((m) => ({ id: m.slug, displayName: m.display_name, description: m.description }));
   }
 
   async *runTurn(opts: TurnOptions): AsyncGenerator<AgentEvent, void, void> {
-    const proc = runProcess("codex", buildArgs(opts), {
-      cwd: opts.cwd,
-      env: buildEnv(opts),
-      signal: opts.signal,
-      timeoutMs: opts.timeoutMs,
-    });
-    let sawTurnComplete = false;
-    for await (const event of translate(proc.lines)) {
-      if (event.type === "turn_complete") sawTurnComplete = true;
-      yield event;
-    }
-    const result = await proc.done;
-    if (!sawTurnComplete) {
-      if (result.timedOut) {
-        yield { type: "error", kind: "timeout", message: "codex timed out", retryable: true };
-      } else if (result.aborted) {
-        yield { type: "error", kind: "cancelled", message: "turn aborted", retryable: false };
-      } else if (result.code !== 0) {
-        const kind = classifyErrorText(result.stderr);
-        yield { type: "error", kind, message: result.stderr.trim() || `exit ${result.code}`, retryable: kind !== "auth" };
+    const homeDir = opts.homeDir ?? pkwnHome();
+    const signal = AbortSignal.any([opts.signal, AbortSignal.timeout(opts.timeoutMs)]);
+    const sessionId = randomUUID();
+    yield { type: "started", backendSessionId: sessionId };
+
+    try {
+      const { accessToken, accountId, fedramp } = await getValidAccessToken(homeDir);
+      const cookies = new CloudflareCookieJar();
+      const model = opts.model ?? DEFAULT_MODEL;
+      const tools = toolsForRequest(opts.permission);
+      const input = historyToInput(opts.history, opts.prompt);
+      const projectContext = await loadProjectContext(opts.cwd);
+      const instructions = projectContext ? formatProjectContext(projectContext) : undefined;
+
+      let ok = false;
+      let cumulativeText = "";
+      const pendingCallArgs = new Map<string, string>();
+      const MAX_TOOL_ITERATIONS = 25;
+
+      for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+        const finishedCalls: Array<{ id: string; name: string; args: unknown }> = [];
+        let iterationText = "";
+        let usage: UsageInfo | undefined;
+
+        const body = { model, input, tools, tool_choice: "auto", parallel_tool_calls: true, stream: true, store: false, instructions };
+        for await (const event of streamResponses(accessToken, accountId, fedramp, cookies, body, signal)) {
+          if (event.type === "response.output_text.delta" && event.delta) {
+            if (iterationText === "" && cumulativeText !== "") cumulativeText += "\n\n";
+            iterationText += event.delta;
+            cumulativeText += event.delta;
+            yield { type: "text", role: "assistant", text: cumulativeText, partial: true };
+          } else if (event.type === "response.reasoning_summary_text.delta" && event.delta) {
+            yield { type: "reasoning", text: event.delta };
+          } else if (event.type === "response.output_item.done" && event.item?.type === "function_call") {
+            const id = event.item.call_id ?? randomUUID();
+            let args: unknown = {};
+            try {
+              args = JSON.parse(event.item.arguments ?? "{}");
+            } catch {
+              args = {};
+            }
+            finishedCalls.push({ id, name: event.item.name ?? "", args });
+            pendingCallArgs.set(id, event.item.arguments ?? "{}");
+            yield { type: "tool_call", id, name: event.item.name ?? "", input: args };
+          } else if (event.type === "response.completed" && event.response?.usage) {
+            const u = event.response.usage;
+            usage = { inputTokens: u.input_tokens, outputTokens: u.output_tokens, cachedInputTokens: u.cached_tokens };
+          } else if (event.type === "response.failed" || event.type === "response.incomplete") {
+            throw new Error(`codex ${event.type}`);
+          }
+        }
+
+        if (usage) yield { type: "usage", usage };
+
+        if (iterationText) yield { type: "text", role: "assistant", text: cumulativeText, partial: false };
+
+        if (finishedCalls.length === 0) {
+          ok = true;
+          break;
+        }
+
+        if (iterationText) input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: iterationText }] });
+        for (const call of finishedCalls) {
+          input.push({ type: "function_call", call_id: call.id, name: call.name, arguments: pendingCallArgs.get(call.id) ?? "{}" });
+          const result = await executeTool(call.name, call.args, { cwd: opts.cwd, permission: opts.permission, signal, ask: opts.ask, toolCallId: call.id });
+          yield { type: "tool_result", id: call.id, output: result.output, isError: result.isError, meta: result.meta };
+          input.push({ type: "function_call_output", call_id: call.id, output: result.output });
+        }
       }
-      yield { type: "turn_complete", ok: result.code === 0 };
+
+      yield { type: "turn_complete", ok };
+    } catch (err) {
+      if (signal.aborted && opts.signal.aborted) {
+        yield { type: "error", kind: "cancelled", message: "turn aborted", retryable: false };
+      } else if (signal.aborted) {
+        yield { type: "error", kind: "timeout", message: "codex turn timed out", retryable: true };
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        const kind = classifyErrorText(message);
+        yield { type: "error", kind, message, retryable: kind !== "auth" };
+      }
+      yield { type: "turn_complete", ok: false };
     }
   }
 }

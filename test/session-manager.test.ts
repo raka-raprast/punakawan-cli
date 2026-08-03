@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { PkwnConfig } from "../src/config.js";
 import { BackendRegistry } from "../src/backends/registry.js";
 import { SessionManager } from "../src/session-manager.js";
@@ -40,6 +41,7 @@ test("session runs a turn end to end and persists to disk", async () => {
     assert.equal(result.finalText, "hello from world");
     assert.equal(sessions.get(meta.id)?.status, "idle");
     assert.equal(sessions.get(meta.id)?.backendSessionId, "fake-session-1");
+    assert.equal(sessions.get(meta.id)?.title, "world", "first message becomes the session title");
 
     const tail = await sessions.transcriptTail(meta.id, 100);
     assert.ok(tail.length > 0, "transcript should have entries");
@@ -125,11 +127,11 @@ test("session surviving a restart is reloaded as interrupted if left running", a
     await sessions.init();
     const meta = await sessions.create({ backend: "claude", cwd: "/tmp" });
 
-    // Simulate a daemon crash mid-turn: hand-write status "running" to disk.
-    const metaPath = join(config.pkwnHome, "sessions", meta.id, "meta.json");
-    const onDisk = JSON.parse(await readFile(metaPath, "utf8"));
-    onDisk.status = "running";
-    await writeFile(metaPath, JSON.stringify(onDisk));
+    // Simulate a daemon crash mid-turn: hand-write status "running" straight
+    // into the sessions.db row, the same way a real crash would leave it.
+    const db = new DatabaseSync(join(config.pkwnHome, "sessions.db"));
+    db.prepare("UPDATE sessions SET status = ? WHERE id = ?").run("running", meta.id);
+    db.close();
 
     const reloaded = new SessionManager(config, registry);
     await reloaded.init();
@@ -146,21 +148,131 @@ test("oversized transcript is rotated instead of growing forever", async () => {
     await sessions.init();
     const meta = await sessions.create({ backend: "claude", cwd: "/tmp" });
 
-    const transcriptPath = join(config.pkwnHome, "sessions", meta.id, "transcript.jsonl");
-    const line = JSON.stringify({ ts: new Date().toISOString(), direction: "out", payload: { type: "warning", message: "x".repeat(500) } });
+    // Bloat transcript_entries directly, well past the rotation threshold,
+    // the same way a long-running session's own turns would over time.
+    const db = new DatabaseSync(join(config.pkwnHome, "sessions.db"));
+    const payload = JSON.stringify({ type: "warning", message: "x".repeat(500) });
+    const insert = db.prepare("INSERT INTO transcript_entries (session_id, ts, direction, payload) VALUES (?, ?, 'out', ?)");
     const targetBytes = 21 * 1024 * 1024;
-    const lineCount = Math.ceil(targetBytes / (line.length + 1));
-    await writeFile(transcriptPath, (line + "\n").repeat(lineCount), "utf8");
-    const before = (await stat(transcriptPath)).size;
+    const rowCount = Math.ceil(targetBytes / payload.length);
+    for (let i = 0; i < rowCount; i++) insert.run(meta.id, new Date().toISOString(), payload);
+
+    const sizeOf = (): number =>
+      (db.prepare("SELECT COALESCE(SUM(LENGTH(payload)), 0) as total FROM transcript_entries WHERE session_id = ?").get(meta.id) as { total: number })
+        .total;
+    const before = sizeOf();
     assert.ok(before > 20 * 1024 * 1024, "test setup should exceed the rotation threshold");
 
     await sessions.sendMessage(meta.id, "trigger rotation");
 
-    const after = (await stat(transcriptPath)).size;
-    // Rotation keeps ~half the prior lines (plus the newly appended turn),
+    const after = sizeOf();
+    // Rotation keeps ~half the prior rows (plus the newly appended turn),
     // so allow slack above exactly 50% instead of asserting a hairline cut.
     assert.ok(after < before * 0.6, "transcript should have been rotated down to roughly half its prior size");
-    const lines = (await readFile(transcriptPath, "utf8")).split("\n").filter(Boolean);
-    for (const l of lines) assert.doesNotThrow(() => JSON.parse(l), "every retained line must still be valid JSON");
+    db.close();
+  });
+});
+
+test("answerAsk resolves a pending ask_user_question tool call mid-turn", async () => {
+  await withTempConfig(async (config) => {
+    const { promise: registered, resolve: signalRegistered } = Promise.withResolvers<void>();
+    const fake = new FakeAdapter("claude");
+    fake.script = [
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "fake-session-1" };
+        // `opts.ask` registers its pending entry synchronously before
+        // returning a promise, so signalling right after the call (and
+        // before awaiting it) tells the test exactly when it's safe to
+        // call `answerAsk` — no wall-clock guess needed.
+        const askPromise = opts.ask!({
+          id: "call-1",
+          question: "which stack?",
+          options: [{ label: "Next.js" }, { label: "Express" }],
+          allowMultiple: false,
+        });
+        signalRegistered();
+        const answer = await askPromise;
+        yield { type: "tool_call", id: "call-1", name: "ask_user_question", input: { question: "which stack?" } };
+        yield { type: "tool_result", id: "call-1", output: `user chose: ${answer.join(", ")}`, isError: false };
+        yield { type: "text", role: "assistant", text: "ok", partial: false };
+        yield { type: "turn_complete", ok: true };
+      },
+    ];
+    const registry = new BackendRegistry(config, [fake]);
+    const sessions = new SessionManager(config, registry);
+    await sessions.init();
+    const meta = await sessions.create({ backend: "claude", cwd: "/tmp" });
+    sessions.subscribe(meta.id, () => {}); // simulates an attached interactive client
+
+    const turn = sessions.sendMessage(meta.id, "pick a stack");
+    await registered;
+    assert.equal(sessions.answerAsk(meta.id, "call-1", ["Next.js"]), true);
+    // A stale/unknown id is a harmless no-op, not an error.
+    assert.equal(sessions.answerAsk(meta.id, "no-such-id", ["x"]), false);
+
+    const result = await turn;
+    assert.equal(result.ok, true);
+    const toolResult = result.events.find((e) => e.type === "tool_result");
+    assert.equal(toolResult?.output, "user chose: Next.js");
+  });
+});
+
+test("cancelPendingAsks abandons a pending question instead of hanging the turn", async () => {
+  await withTempConfig(async (config) => {
+    const { promise: registered, resolve: signalRegistered } = Promise.withResolvers<void>();
+    const fake = new FakeAdapter("claude");
+    fake.script = [
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "fake-session-1" };
+        const askPromise = opts.ask!({ id: "call-1", question: "which stack?", options: [{ label: "a" }], allowMultiple: false });
+        signalRegistered();
+        const answer = await askPromise;
+        yield { type: "tool_result", id: "call-1", output: answer.length === 0 ? "dismissed" : answer.join(", "), isError: false };
+        yield { type: "turn_complete", ok: true };
+      },
+    ];
+    const registry = new BackendRegistry(config, [fake]);
+    const sessions = new SessionManager(config, registry);
+    await sessions.init();
+    const meta = await sessions.create({ backend: "claude", cwd: "/tmp" });
+    sessions.subscribe(meta.id, () => {}); // simulates an attached interactive client
+
+    const turn = sessions.sendMessage(meta.id, "pick a stack");
+    await registered;
+    sessions.cancelPendingAsks(meta.id);
+
+    const result = await turn;
+    assert.equal(result.ok, true);
+    const toolResult = result.events.find((e) => e.type === "tool_result");
+    assert.equal(toolResult?.output, "dismissed");
+  });
+});
+
+test("ask rejects immediately when no interactive client is attached, instead of hanging", async () => {
+  await withTempConfig(async (config) => {
+    const fake = new FakeAdapter("claude");
+    fake.script = [
+      async function* (opts) {
+        yield { type: "started", backendSessionId: "fake-session-1" };
+        let message = "unexpectedly resolved";
+        try {
+          await opts.ask!({ id: "call-1", question: "which stack?", options: [{ label: "a" }], allowMultiple: false });
+        } catch (err) {
+          message = err instanceof Error ? err.message : String(err);
+        }
+        yield { type: "tool_result", id: "call-1", output: message, isError: true };
+        yield { type: "turn_complete", ok: true };
+      },
+    ];
+    const registry = new BackendRegistry(config, [fake]);
+    const sessions = new SessionManager(config, registry);
+    await sessions.init();
+    const meta = await sessions.create({ backend: "claude", cwd: "/tmp" });
+    // Deliberately no `sessions.subscribe(...)` here — nothing is attached.
+
+    const result = await sessions.sendMessage(meta.id, "pick a stack");
+    assert.equal(result.ok, true);
+    const toolResult = result.events.find((e) => e.type === "tool_result");
+    assert.equal(toolResult?.output, "no interactive client attached to this session");
   });
 });

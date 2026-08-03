@@ -42,26 +42,73 @@ export type AgentEvent =
       output?: unknown;
       isError: boolean;
       error?: string;
+      /** Opaque tool-specific display hints (e.g. `run_bash`'s wall time
+       * and effective timeout) — ignored by everything except the TUI's
+       * own rendering, threaded straight through from `ToolExecutionResult`. */
+      meta?: Record<string, unknown>;
     }
   | { type: "usage"; usage: UsageInfo }
   | { type: "warning"; message: string }
   | { type: "error"; kind: ErrorKind; message: string; retryable: boolean }
   | { type: "turn_complete"; ok: boolean; stopReason?: string };
 
+/** One collapsed content block within a turn's final (non-streaming) state
+ * — direct-API adapters are stateless per HTTP call, so the full prior
+ * conversation must be resent as `TurnOptions.history` on every turn
+ * (unlike CLI `--resume`, which let the vendor CLI remember it locally). */
+export interface HistoryBlock {
+  type: "text" | "tool_use" | "tool_result";
+  text?: string;
+  /** tool_use/tool_result correlation id. */
+  id?: string;
+  name?: string;
+  input?: unknown;
+  output?: unknown;
+  isError?: boolean;
+}
+
+export interface HistoryTurn {
+  role: "user" | "assistant";
+  blocks: HistoryBlock[];
+}
+
+export interface AskOption {
+  label: string;
+  description?: string;
+}
+
+/** A pending `ask_user_question` tool call, correlated by `id` (the
+ * tool_use/function-call id) so an out-of-band answer can be routed back
+ * to the right pending call. */
+export interface AskRequest {
+  id: string;
+  question: string;
+  options: AskOption[];
+  allowMultiple: boolean;
+}
+
 export interface TurnOptions {
-  /** Working directory the CLI should run in. Session/resume lookup for
-   * Claude, Codex, and Gemini is all scoped (directly or via project hash)
-   * to this directory, so it must stay stable across turns of one session. */
+  /** Working directory for tool execution (file edits, shell commands). */
   cwd: string;
   prompt: string;
-  /** Backend-native session/thread id to resume, or undefined for a fresh session. */
-  resumeId?: string;
+  /** Full prior conversation for this session, oldest first. Empty on the
+   * first turn. */
+  history: HistoryTurn[];
   model?: string;
   permission: PermissionTier;
-  /** Isolated credential/config home dir override (per-worker auth isolation). */
+  /** Isolated credential storage dir override (per-worker auth isolation). */
   homeDir?: string;
   signal: AbortSignal;
   timeoutMs: number;
+  /** Lets the `ask_user_question` tool pause the turn and collect a live
+   * choice from whoever is attached to this session. Undefined for
+   * contexts with no interactive human ever possible (`pkwn verify`).
+   * Where it *is* provided (every session-manager-backed turn, including
+   * the OpenAI-compatible chat/completions endpoint), it still rejects
+   * immediately rather than hanging until the turn's timeout if nothing
+   * is actually attached to answer at call time — the tool degrades to
+   * an error result in both cases. */
+  ask?: (request: AskRequest) => Promise<string[]>;
 }
 
 export interface AuthStatus {
@@ -73,12 +120,34 @@ export interface AuthStatus {
   detail?: string;
 }
 
+export interface ModelInfo {
+  id: string;
+  displayName?: string;
+  description?: string;
+}
+
 export interface BackendAdapter {
   readonly id: BackendId;
   readonly displayName: string;
-  /** Default max concurrent OS processes the daemon will run for this backend. */
+  /** Default max concurrent requests the daemon will run for this backend. */
   readonly defaultMaxConcurrency: number;
   checkAuth(homeDir?: string): Promise<AuthStatus>;
+  /** Runs this backend's own OAuth login flow end to end — pkwn's own
+   * OAuth client, independent of the vendor CLI. Most providers catch the
+   * redirect on a local callback server automatically; Anthropic's
+   * subscription OAuth redirects to a fixed Anthropic-hosted page instead
+   * (no local port to catch), so `prompt` lets the adapter ask the caller
+   * (the chat REPL's own `question()`) to relay a manually-pasted code. */
+  login(opts: { homeDir?: string; prompt: (question: string) => Promise<string> }): Promise<AuthStatus>;
+  logout(homeDir?: string): Promise<void>;
+  /** The models this backend's account can actually use *right now* —
+   * queried live from the provider where that's possible (Anthropic,
+   * OpenAI/Codex both expose a real models-list endpoint pkwn's own OAuth
+   * token can call directly). Backends with no such endpoint (Gemini's
+   * Code Assist internal API doesn't have one — verified, `:listModels`
+   * 404s) fall back to a maintained static list; check the adapter's own
+   * comment for that backend's actual source of truth. */
+  listModels(homeDir?: string): Promise<ModelInfo[]>;
   runTurn(opts: TurnOptions): AsyncGenerator<AgentEvent, void, void>;
 }
 
@@ -96,9 +165,12 @@ export interface SessionMeta {
   cwd: string;
   model?: string;
   permission: PermissionTier;
-  homeDir?: string;
   backendSessionId?: string;
   status: SessionStatus;
+  /** Auto-generated after the session's first successful turn (a short
+   * summary of what the conversation is about), same idea as most chat
+   * UIs' thread titles. Absent until that background generation lands. */
+  title?: string;
   createdAt: string;
   updatedAt: string;
   lastError?: string;
