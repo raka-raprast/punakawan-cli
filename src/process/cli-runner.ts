@@ -3,7 +3,7 @@
 // (not just the immediate child) on abort/timeout so a coding agent's own
 // spawned sub-shells never survive their session.
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
 const STDERR_CAP = 64 * 1024;
@@ -40,7 +40,13 @@ export function runProcess(
     cwd: opts.cwd,
     env: opts.env,
     stdio: ["ignore", "pipe", "pipe"],
-    detached: true, // own process group, so we can kill the whole tree
+    // POSIX process-group kill (killTree, below) relies on this. Windows
+    // has no equivalent notion of process groups here — worse, setting it
+    // breaks piped stdio for at least `powershell.exe` (confirmed: with
+    // `detached: true` a plain `echo` produces empty stdout; identical
+    // spawn with it unset captures normally) — so it's POSIX-only, and
+    // `killTree` below uses `taskkill /t` for the Windows tree-kill case.
+    detached: process.platform !== "win32",
   });
 
   let stderr = "";
@@ -58,8 +64,17 @@ export function runProcess(
   const killTree = (signal: NodeJS.Signals) => {
     if (killedAlready) return;
     killedAlready = true;
+    if (!child.pid) return;
+    if (process.platform === "win32") {
+      // `child.kill()` on Windows only terminates the immediate process,
+      // never its descendants — `taskkill /t` is the actual tree-kill.
+      execFile("taskkill", ["/pid", String(child.pid), "/t", "/f"], () => {
+        /* best-effort — process may have already exited on its own */
+      });
+      return;
+    }
     try {
-      if (child.pid) process.kill(-child.pid, signal);
+      process.kill(-child.pid, signal);
     } catch {
       try {
         child.kill(signal);

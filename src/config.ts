@@ -20,6 +20,14 @@ export interface TelegramGatewayConfig {
   backend?: BackendId;
   cwd?: string;
   permission?: PermissionTier;
+  /** HTTP/HTTPS CONNECT proxy the gateway's Telegram Bot API calls tunnel
+   * through (e.g. `http://100.x.y.z:8888`, a Tailscale peer running a
+   * plain forward proxy) — for a network where the gateway's own egress
+   * to `api.telegram.org` is blocked/throttled but the daemon and every
+   * other outbound call the gateway makes (the daemon's own HTTP API)
+   * still needs to go direct, so this is scoped to just the Telegram
+   * client rather than a machine-wide proxy/exit-node setting. */
+  proxyUrl?: string;
 }
 
 export interface PkwnConfig {
@@ -65,6 +73,7 @@ function loadTelegramConfig(fileValue: TelegramGatewayConfig | undefined): Teleg
     backend: (process.env["PKWN_TELEGRAM_BACKEND"] as BackendId | undefined) ?? fileValue?.backend,
     cwd: process.env["PKWN_TELEGRAM_CWD"] ?? fileValue?.cwd,
     permission: (process.env["PKWN_TELEGRAM_PERMISSION"] as PermissionTier | undefined) ?? fileValue?.permission,
+    proxyUrl: process.env["PKWN_TELEGRAM_PROXY_URL"] ?? fileValue?.proxyUrl,
   };
   const hasAnySetting = Object.values(telegram).some((v) => v !== undefined);
   return hasAnySetting ? telegram : undefined;

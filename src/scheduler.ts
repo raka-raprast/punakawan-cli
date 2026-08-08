@@ -310,7 +310,7 @@ export class Scheduler {
   private getTelegramClient(): TelegramClient | undefined {
     if (this.telegramClient) return this.telegramClient;
     if (!this.config.telegram?.botToken) return undefined;
-    this.telegramClient = createTelegramClient(this.config.telegram.botToken);
+    this.telegramClient = createTelegramClient(this.config.telegram.botToken, this.config.telegram.proxyUrl);
     return this.telegramClient;
   }
 

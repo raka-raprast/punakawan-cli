@@ -2,6 +2,17 @@
 // the same primitive the old CLI-shelling adapters used) rather than a raw
 // `child_process.spawn` here.
 //
+// Shell interpreter is platform-dependent: `bash` doesn't exist on a
+// stock Windows install (no WSL/Git Bash implied), so a hardcoded
+// `spawn("bash", ...)` fails every single call there with `spawn bash
+// ENOENT` — the model sees that as a generic tool error and (reasonably,
+// if confusingly) reports "no shell access" back to the user. PowerShell
+// ships on every Windows install, so it's the platform-appropriate
+// fallback; command syntax the model emits is usually bash-flavored, so
+// PowerShell-isms (aliases like `ls`/`cat`/`rm` work, GNU-style flags
+// like `ls -la` don't) still trip some commands up, but that's a much
+// smaller gap than "the tool never runs at all."
+//
 // IMPORTANT SCOPE NOTE: this is a denylist heuristic, not a sandbox. It
 // blocks the most obviously destructive command shapes but is trivially
 // bypassable (encoding, indirection, etc.) by a sufficiently adversarial
@@ -24,7 +35,10 @@ const DANGEROUS_PATTERNS: RegExp[] = [
 
 export const runBashTool: ToolDefinition = {
   name: "run_bash",
-  description: "Run a shell command in the session's working directory. Only available in 'edit' or 'full' permission mode.",
+  description:
+    process.platform === "win32"
+      ? "Run a shell command (PowerShell) in the session's working directory. Only available in 'edit' or 'full' permission mode. This host is Windows: use PowerShell syntax/cmdlets (Get-ChildItem, Remove-Item, etc.), not bash/GNU flags."
+      : "Run a shell command (bash) in the session's working directory. Only available in 'edit' or 'full' permission mode.",
   inputSchema: {
     type: "object",
     properties: {
@@ -45,7 +59,9 @@ export async function runBash(input: unknown, ctx: ToolContext): Promise<ToolExe
 
   const timeoutMs = args.timeout_ms ?? 120_000;
   const startedAt = Date.now();
-  const proc = runProcess("bash", ["-lc", args.command], {
+  const [shellCmd, shellArgs] =
+    process.platform === "win32" ? ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", args.command]] : ["bash", ["-lc", args.command]];
+  const proc = runProcess(shellCmd, shellArgs, {
     cwd: ctx.cwd,
     env: process.env,
     signal: ctx.signal,

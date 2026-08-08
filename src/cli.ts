@@ -321,4 +321,11 @@ async function main(): Promise<void> {
 main().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
   process.exitCode = 1;
+  // `process.exitCode` alone only takes effect once the event loop
+  // drains on its own — `daemon` starts the scheduler's interval timer
+  // before attempting to bind its HTTP port, so a bind failure (e.g.
+  // the EADDRINUSE race ensureDaemonRunning's own doc comment promises
+  // "exits immediately") would otherwise leave an orphaned process
+  // still running a second scheduler against the same schedules.db.
+  process.exit(process.exitCode);
 });

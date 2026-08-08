@@ -8,9 +8,11 @@ import { loadSkills } from "../skills.js";
 import { Router, type RouteContext } from "./router.js";
 import { HttpError, readJsonBody, sendJson, SseWriter } from "./http-utils.js";
 import type { AgentEvent, BackendId, PermissionTier } from "../types.js";
-
+import { DASHBOARD_HTML } from "./dashboard.js";
 const PERMISSION_TIERS = new Set(["safe", "edit", "full"]);
 const BACKEND_IDS = new Set<BackendId>(["claude", "codex", "gemini"]);
+// Static membership check, not a mutable runtime collection.
+const PUBLIC_PATHS: Record<string, true> = { "/healthz": true, "/dashboard": true };
 
 function isBackendId(value: unknown): value is BackendId {
   return typeof value === "string" && BACKEND_IDS.has(value as BackendId);
@@ -104,7 +106,7 @@ async function handleRequest(
   res: ServerResponse,
 ): Promise<void> {
   const url = new URL(req.url ?? "/", "http://internal");
-  if (url.pathname !== "/healthz" && !authorize(config, req, url)) {
+  if (!PUBLIC_PATHS[url.pathname] && !authorize(config, req, url)) {
     sendJson(res, 401, { error: "missing or invalid bearer token" });
     return;
   }
@@ -163,6 +165,11 @@ function registerRoutes(
 ): void {
   router.get("/healthz", (ctx) => {
     sendJson(ctx.res, 200, { ok: true, uptimeSec: process.uptime(), sessions: sessions.list().length });
+  });
+
+  router.get("/dashboard", (ctx) => {
+    ctx.res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    ctx.res.end(DASHBOARD_HTML);
   });
 
   router.get("/v1/models", (ctx) => {

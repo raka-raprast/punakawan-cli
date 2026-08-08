@@ -43,8 +43,17 @@ const DEFAULT_MODEL = "claude-sonnet-4-5";
 const OAUTH_LOGIN_TIMEOUT_MS = 10 * 60_000;
 
 function openBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  spawn(cmd, [url], { stdio: "ignore", detached: true }).unref();
+  const child =
+    process.platform === "darwin"
+      ? spawn("open", [url], { stdio: "ignore", detached: true })
+      : process.platform === "win32"
+        ? spawn("cmd", ["/c", "start", "", url], { stdio: "ignore", detached: true, windowsHide: true })
+        : spawn("xdg-open", [url], { stdio: "ignore", detached: true });
+  // Best-effort only: a headless box with no browser/handler (or, on
+  // Windows, `start` being a cmd.exe builtin rather than a real exe)
+  // must never crash the login flow — the URL is already printed above.
+  child.on("error", () => {});
+  child.unref();
 }
 
 /** Best-effort reproduction of the embedded pseudo-billing-header text
